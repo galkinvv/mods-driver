@@ -1,7 +1,7 @@
 /*
  * mods_debugfs.c - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2014-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -30,7 +30,7 @@
 
 static struct dentry *mods_debugfs_dir;
 
-#if defined(CONFIG_ARCH_TEGRA) && defined(MODS_HAS_KFUSE)
+#if defined(MODS_TEGRA) && defined(MODS_HAS_KFUSE)
 #include <mach/kfuse.h>
 #endif
 
@@ -570,7 +570,7 @@ static const struct file_operations mods_dc_crc_latched_fops = {
 };
 #endif /* CONFIG_TEGRA_DC */
 
-#if defined(CONFIG_ARCH_TEGRA) && defined(MODS_HAS_KFUSE)
+#if defined(MODS_TEGRA) && defined(MODS_HAS_KFUSE)
 static int mods_kfuse_show(struct seq_file *s, void *unused)
 {
 	unsigned buf[KFUSE_DATA_SZ / 4];
@@ -600,7 +600,7 @@ static const struct file_operations mods_kfuse_fops = {
 	.llseek		= seq_lseek,
 	.release	= single_release,
 };
-#endif /* CONFIG_ARCH_TEGRA */
+#endif /* MODS_TEGRA */
 
 static int mods_debug_get(void *data, u64 *val)
 {
@@ -666,7 +666,7 @@ int mods_create_debugfs(struct miscdevice *modsdev)
 		goto remove_out;
 	}
 
-#if defined(CONFIG_ARCH_TEGRA) && defined(MODS_HAS_KFUSE)
+#if defined(MODS_TEGRA) && defined(MODS_HAS_KFUSE)
 	retval = debugfs_create_file("kfuse_data", S_IRUGO,
 		mods_debugfs_dir, 0, &mods_kfuse_fops);
 	if (IS_ERR(retval)) {
@@ -678,13 +678,17 @@ int mods_create_debugfs(struct miscdevice *modsdev)
 #ifdef CONFIG_TEGRA_DC
 	for (dc_idx = 0; dc_idx < TEGRA_MAX_DC; dc_idx++) {
 		struct dentry *dc_debugfs_dir;
+#ifdef CONFIG_TEGRA_NVSD
 		struct dentry *sd_debugfs_dir;
+#endif
+		char devname[16];
 		struct tegra_dc *dc = tegra_dc_get_dc(dc_idx);
 		if (!dc)
 			continue;
 
-		dc_debugfs_dir = debugfs_create_dir(dev_name(&dc->ndev->dev),
-			mods_debugfs_dir);
+		snprintf(devname, sizeof(devname), "tegradc.%d", dc->ctrl_num);
+		dc_debugfs_dir = debugfs_create_dir(devname, mods_debugfs_dir);
+
 		if (IS_ERR(dc_debugfs_dir)) {
 			err = -EIO;
 			goto remove_out;
@@ -759,6 +763,7 @@ int mods_create_debugfs(struct miscdevice *modsdev)
 			goto remove_out;
 		}
 
+#if defined(CONFIG_TEGRA_NVSD)
 		sd_debugfs_dir = debugfs_create_dir("smartdimmer",
 			dc_debugfs_dir);
 
@@ -786,8 +791,9 @@ int mods_create_debugfs(struct miscdevice *modsdev)
 			err = -EIO;
 			goto remove_out;
 		}
+#endif
 
-		if (dc->out->type == TEGRA_DC_OUT_DSI) {
+		if (dc->out && dc->out->type == TEGRA_DC_OUT_DSI) {
 			struct dentry *dsi_debugfs_dir;
 			dsi_debugfs_dir = debugfs_create_dir("dsi",
 				dc_debugfs_dir);
@@ -811,7 +817,7 @@ int mods_create_debugfs(struct miscdevice *modsdev)
 			}
 		}
 
-		if (dc->out->type == TEGRA_DC_OUT_HDMI) {
+		if (dc->out && dc->out->type == TEGRA_DC_OUT_HDMI) {
 			retval = debugfs_create_file("ddc_bus", S_IRUGO,
 				dc_debugfs_dir, dc, &mods_dc_ddc_bus_fops);
 			if (IS_ERR(retval)) {
@@ -824,7 +830,7 @@ int mods_create_debugfs(struct miscdevice *modsdev)
 
 	return 0;
 remove_out:
-	dev_err(modsdev->this_device, "could not create debugfs\n");
+	mods_error_printk("failed to create debugfs nodes\n");
 	mods_remove_debugfs();
 	return err;
 #else

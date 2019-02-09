@@ -1,7 +1,7 @@
 /*
  * mods_krnl.c - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2008-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2008-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -23,6 +23,7 @@
 #include <linux/init.h>
 #include <linux/poll.h>
 #include <linux/miscdevice.h>
+#include <linux/screen_info.h>
 #include <linux/uaccess.h>
 
 /***********************************************************************
@@ -55,12 +56,71 @@ struct miscdevice mods_dev = {
 	.fops = &mods_fops
 };
 
+#if defined(MODS_CAN_REGISTER_PCI_DEV)
+static pci_ers_result_t mods_pci_error_detected(struct pci_dev *,
+						enum pci_channel_state);
+static pci_ers_result_t mods_pci_mmio_enabled(struct pci_dev *);
+static void mods_pci_resume(struct pci_dev *);
+
+struct pci_error_handlers mods_pci_error_handlers = {
+	.error_detected	= mods_pci_error_detected,
+	.mmio_enabled	= mods_pci_mmio_enabled,
+	.resume		= mods_pci_resume,
+};
+
+DEFINE_PCI_DEVICE_TABLE(mods_pci_table) = {
+	{
+		.vendor		= PCI_VENDOR_ID_NVIDIA,
+		.device		= PCI_ANY_ID,
+		.subvendor	= PCI_ANY_ID,
+		.subdevice	= PCI_ANY_ID,
+		.class		= (PCI_CLASS_DISPLAY_VGA << 8),
+		.class_mask	= ~0
+	},
+	{
+		.vendor		= PCI_VENDOR_ID_NVIDIA,
+		.device		= PCI_ANY_ID,
+		.subvendor	= PCI_ANY_ID,
+		.subdevice	= PCI_ANY_ID,
+		.class		= (PCI_CLASS_DISPLAY_3D << 8),
+		.class_mask	= ~0
+	},
+	{ }
+};
+
+static int mods_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
+{
+	return 0;
+}
+
+struct pci_driver mods_pci_driver = {
+	.name		= DEVICE_NAME,
+	.id_table	= mods_pci_table,
+	.probe		= mods_pci_probe,
+	.err_handler	= &mods_pci_error_handlers,
+};
+#endif
+
 /***********************************************
  * module wide parameters and access functions *
  * used to avoid globalization of variables    *
  ***********************************************/
 static int debug = -0x80000000;
 static int multi_instance = MODS_MULTI_INSTANCE_DEFAULT_VALUE;
+
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+static int ppc_tce_bypass;
+
+void mods_set_ppc_tce_bypass(int bypass)
+{
+	ppc_tce_bypass = bypass;
+}
+
+int mods_get_ppc_tce_bypass(void)
+{
+	return ppc_tce_bypass;
+}
+#endif
 
 void mods_set_debug_level(int mask)
 {
@@ -100,9 +160,15 @@ static int __init mods_init_module(void)
 	if (rc < 0)
 		return -EBUSY;
 
+#if defined(MODS_CAN_REGISTER_PCI_DEV)
+	rc = pci_register_driver(&mods_pci_driver);
+	if (rc < 0)
+		return -EBUSY;
+#endif
+
 	mods_init_irq();
 
-#ifdef CONFIG_ARCH_TEGRA
+#if defined(MODS_HAS_CLOCK)
 	mods_init_clock_api();
 #endif
 
@@ -137,9 +203,13 @@ static void __exit mods_exit_module(void)
 
 	mods_cleanup_irq();
 
+#if defined(MODS_CAN_REGISTER_PCI_DEV)
+	pci_unregister_driver(&mods_pci_driver);
+#endif
+
 	misc_deregister(&mods_dev);
 
-#ifdef CONFIG_ARCH_TEGRA
+#if defined(MODS_HAS_CLOCK)
 	mods_shutdown_clock_api();
 #endif
 
@@ -163,6 +233,12 @@ MODULE_PARM_DESC(multi_instance,
 		 "allows more than one client to connect simultaneously to "
 		 "the driver");
 
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+module_param(ppc_tce_bypass, int, MODS_PPC_TCE_BYPASS_DEFAULT);
+MODULE_PARM_DESC(ppc_tce_bypass,
+	"PPC TCE bypass (0=sys default, 1=force bypass, 2=force non bypass)");
+#endif
+
 /********************
  * HELPER FUNCTIONS *
  ********************/
@@ -176,14 +252,16 @@ static int id_is_valid(unsigned char channel)
 
 static void mods_disable_all_devices(struct mods_file_private_data *priv)
 {
+#ifdef CONFIG_PCI
 	while (priv->enabled_devices != 0) {
 		struct en_dev_entry *old = priv->enabled_devices;
-#ifdef CONFIG_PCI
 		pci_disable_device(old->dev);
-#endif
 		priv->enabled_devices = old->next;
 		kfree(old);
 	}
+#else
+	BUG_ON(priv->enabled_devices != 0);
+#endif
 }
 
 /*********************
@@ -328,6 +406,45 @@ static const char *mods_get_prot_str_for_range(struct file *fp,
 	}
 	return "default";
 }
+/********************
+ * PCI ERROR FUNCTIONS *
+ ********************/
+#if defined(MODS_CAN_REGISTER_PCI_DEV)
+static pci_ers_result_t mods_pci_error_detected(struct pci_dev *dev,
+						enum pci_channel_state state)
+{
+	mods_debug_printk(DEBUG_PCICFG,
+			  "pci_error_detected %04x:%x:%02x.%x\n",
+			  pci_domain_nr(dev->bus),
+			  dev->bus->number,
+			  PCI_SLOT(dev->devfn),
+			  PCI_FUNC(dev->devfn));
+
+	return PCI_ERS_RESULT_CAN_RECOVER;
+}
+
+static pci_ers_result_t mods_pci_mmio_enabled(struct pci_dev *dev)
+{
+	mods_debug_printk(DEBUG_PCICFG,
+			  "pci_mmio_enabled %04x:%x:%02x.%x\n",
+			  pci_domain_nr(dev->bus),
+			  dev->bus->number,
+			  PCI_SLOT(dev->devfn),
+			  PCI_FUNC(dev->devfn));
+
+	return PCI_ERS_RESULT_NEED_RESET;
+}
+
+static void mods_pci_resume(struct pci_dev *dev)
+{
+	mods_debug_printk(DEBUG_PCICFG,
+			  "pci_resume %04x:%x:%02x.%x\n",
+			  pci_domain_nr(dev->bus),
+			  dev->bus->number,
+			  PCI_SLOT(dev->devfn),
+			  PCI_FUNC(dev->devfn));
+}
+#endif
 
 /********************
  * KERNEL FUNCTIONS *
@@ -388,6 +505,10 @@ static int mods_krnl_open(struct inode *ip, struct file *fp)
 {
 	struct list_head *mods_alloc_list;
 	struct list_head *mods_mapping_list;
+	struct list_head *mods_pci_res_map_list;
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+	struct list_head *mods_ppc_tce_bypass_list;
+#endif
 	struct mods_file_private_data *private_data;
 	int id = 0;
 
@@ -406,10 +527,34 @@ static int mods_krnl_open(struct inode *ip, struct file *fp)
 		return -ENOMEM;
 	}
 
+	mods_pci_res_map_list = kmalloc(sizeof(struct list_head), GFP_KERNEL);
+	if (unlikely(!mods_pci_res_map_list)) {
+		kfree(mods_alloc_list);
+		kfree(mods_mapping_list);
+		LOG_EXT();
+		return -ENOMEM;
+	}
+
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+	mods_ppc_tce_bypass_list =
+		kmalloc(sizeof(struct list_head), GFP_KERNEL);
+	if (unlikely(!mods_ppc_tce_bypass_list)) {
+		kfree(mods_alloc_list);
+		kfree(mods_mapping_list);
+		kfree(mods_pci_res_map_list);
+		LOG_EXT();
+		return -ENOMEM;
+	}
+#endif
+
 	private_data = kmalloc(sizeof(*private_data), GFP_KERNEL);
 	if (unlikely(!private_data)) {
 		kfree(mods_alloc_list);
 		kfree(mods_mapping_list);
+		kfree(mods_pci_res_map_list);
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+		kfree(mods_ppc_tce_bypass_list);
+#endif
 		LOG_EXT();
 		return -ENOMEM;
 	}
@@ -419,6 +564,10 @@ static int mods_krnl_open(struct inode *ip, struct file *fp)
 		mods_error_printk("too many clients\n");
 		kfree(mods_alloc_list);
 		kfree(mods_mapping_list);
+		kfree(mods_pci_res_map_list);
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+		kfree(mods_ppc_tce_bypass_list);
+#endif
 		kfree(private_data);
 		LOG_EXT();
 		return -EBUSY;
@@ -429,8 +578,14 @@ static int mods_krnl_open(struct inode *ip, struct file *fp)
 
 	INIT_LIST_HEAD(mods_alloc_list);
 	INIT_LIST_HEAD(mods_mapping_list);
+	INIT_LIST_HEAD(mods_pci_res_map_list);
 	private_data->mods_alloc_list = mods_alloc_list;
 	private_data->mods_mapping_list = mods_mapping_list;
+	private_data->mods_pci_res_map_list = mods_pci_res_map_list;
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+	INIT_LIST_HEAD(mods_ppc_tce_bypass_list);
+	private_data->mods_ppc_tce_bypass_list = mods_ppc_tce_bypass_list;
+#endif
 	private_data->enabled_devices = 0;
 	private_data->mem_type.dma_addr = 0;
 	private_data->mem_type.size = 0;
@@ -463,10 +618,24 @@ static int mods_krnl_close(struct inode *ip, struct file *fp)
 	ret = mods_unregister_all_alloc(fp);
 	if (ret)
 		mods_error_printk("failed to free all memory\n");
+	ret = MODS_UNREGISTER_PCI_MAP(fp);
+	if (ret)
+		mods_error_printk("failed to free pci mappings\n");
+
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+	ret = mods_unregister_all_ppc_tce_bypass(fp);
+	if (ret)
+		mods_error_printk("failed to restore dma bypass\n");
+#endif
+
 	mods_disable_all_devices(private_data);
 
 	kfree(private_data->mods_alloc_list);
 	kfree(private_data->mods_mapping_list);
+	kfree(private_data->mods_pci_res_map_list);
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+	kfree(private_data->mods_ppc_tce_bypass_list);
+#endif
 	kfree(private_data);
 
 	mods_info_printk("driver closed\n");
@@ -688,6 +857,23 @@ int esc_mods_set_driver_para(struct file *pfile, struct MODS_SET_PARA *p)
 	return rc;
 }
 
+int esc_mods_get_screen_info(struct file *pfile, struct MODS_SCREEN_INFO *p)
+{
+#if defined(CONFIG_ARM) || defined(CONFIG_ARM64) || defined(CONFIG_PPC64)
+	return -ENOSYS;
+#else
+	p->orig_video_mode = screen_info.orig_video_mode;
+	p->orig_video_is_vga = screen_info.orig_video_isVGA;
+	p->lfb_width = screen_info.lfb_width;
+	p->lfb_height = screen_info.lfb_height;
+	p->lfb_depth = screen_info.lfb_depth;
+	p->lfb_base = screen_info.lfb_base;
+	p->lfb_size = screen_info.lfb_size;
+	p->lfb_linelength = screen_info.lfb_linelength;
+	return OK;
+#endif
+}
+
 /**************
  * IO control *
  **************/
@@ -848,6 +1034,12 @@ static long mods_krnl_ioctl(struct file  *fp,
 				    MODS_PCI_BUS_ADD_DEVICES);
 		break;
 
+	case MODS_ESC_PCI_HOT_RESET:
+		MODS_IOCTL_NORETVAL(MODS_ESC_PCI_HOT_RESET,
+				    esc_mods_pci_hot_reset,
+				    MODS_PCI_HOT_RESET);
+		break;
+
 	case MODS_ESC_PIO_READ:
 		MODS_IOCTL(MODS_ESC_PIO_READ,
 			   esc_mods_pio_read, MODS_PIO_READ);
@@ -868,6 +1060,18 @@ static long mods_krnl_ioctl(struct file  *fp,
 		MODS_IOCTL(MODS_ESC_DEVICE_NUMA_INFO_2,
 			   esc_mods_device_numa_info_2,
 			   MODS_DEVICE_NUMA_INFO_2);
+		break;
+
+	case MODS_ESC_PCI_MAP_RESOURCE:
+		MODS_IOCTL(MODS_ESC_PCI_MAP_RESOURCE,
+			   esc_mods_pci_map_resource,
+			   MODS_PCI_MAP_RESOURCE);
+		break;
+
+	case MODS_ESC_PCI_UNMAP_RESOURCE:
+		MODS_IOCTL(MODS_ESC_PCI_UNMAP_RESOURCE,
+			   esc_mods_pci_unmap_resource,
+			   MODS_PCI_UNMAP_RESOURCE);
 		break;
 #endif
 
@@ -905,6 +1109,12 @@ static long mods_krnl_ioctl(struct file  *fp,
 			   MODS_GET_PHYSICAL_ADDRESS);
 		break;
 
+	case MODS_ESC_GET_MAPPED_PHYSICAL_ADDRESS_2:
+		MODS_IOCTL(MODS_ESC_GET_MAPPED_PHYSICAL_ADDRESS_2,
+			   esc_mods_get_mapped_phys_addr_2,
+			   MODS_GET_PHYSICAL_ADDRESS_2);
+		break;
+
 	case MODS_ESC_SET_MEMORY_TYPE:
 		MODS_IOCTL_NORETVAL(MODS_ESC_SET_MEMORY_TYPE,
 				    esc_mods_set_mem_type,
@@ -922,6 +1132,26 @@ static long mods_krnl_ioctl(struct file  *fp,
 			   esc_mods_phys_to_virtual, MODS_PHYSICAL_TO_VIRTUAL);
 		break;
 
+#if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
+	case MODS_ESC_SET_PPC_TCE_BYPASS:
+		MODS_IOCTL(MODS_ESC_SET_PPC_TCE_BYPASS,
+			   esc_mods_set_ppc_tce_bypass,
+			   MODS_SET_PPC_TCE_BYPASS);
+		break;
+#endif
+
+	case MODS_ESC_DMA_MAP_MEMORY:
+		MODS_IOCTL(MODS_ESC_DMA_MAP_MEMORY,
+			   esc_mods_dma_map_memory,
+			   MODS_DMA_MAP_MEMORY);
+		break;
+
+	case MODS_ESC_DMA_UNMAP_MEMORY:
+		MODS_IOCTL(MODS_ESC_DMA_UNMAP_MEMORY,
+			   esc_mods_dma_unmap_memory,
+			   MODS_DMA_MAP_MEMORY);
+		break;
+
 	case MODS_ESC_IRQ_REGISTER:
 	case MODS_ESC_MSI_REGISTER:
 		ret = -EINVAL;
@@ -929,13 +1159,17 @@ static long mods_krnl_ioctl(struct file  *fp,
 
 	case MODS_ESC_REGISTER_IRQ:
 		MODS_IOCTL_NORETVAL(MODS_ESC_REGISTER_IRQ,
-				    esc_mods_register_irq, MODS_REGISTER_IRQ);
+				esc_mods_register_irq, MODS_REGISTER_IRQ);
 		break;
 
 	case MODS_ESC_REGISTER_IRQ_2:
 		MODS_IOCTL_NORETVAL(MODS_ESC_REGISTER_IRQ_2,
-				    esc_mods_register_irq_2,
-				    MODS_REGISTER_IRQ_2);
+				esc_mods_register_irq_2, MODS_REGISTER_IRQ_2);
+		break;
+
+	case MODS_ESC_REGISTER_IRQ_3:
+		MODS_IOCTL_NORETVAL(MODS_ESC_REGISTER_IRQ_3,
+				esc_mods_register_irq_3, MODS_REGISTER_IRQ_3);
 		break;
 
 	case MODS_ESC_UNREGISTER_IRQ:
@@ -968,6 +1202,12 @@ static long mods_krnl_ioctl(struct file  *fp,
 		MODS_IOCTL_NORETVAL(MODS_ESC_SET_IRQ_MASK_2,
 				    esc_mods_set_irq_mask_2,
 				    MODS_SET_IRQ_MASK_2);
+		break;
+
+	case MODS_ESC_SET_IRQ_MULTIMASK:
+		MODS_IOCTL_NORETVAL(MODS_ESC_SET_IRQ_MULTIMASK,
+				    esc_mods_set_irq_multimask,
+				    MODS_SET_IRQ_MULTIMASK);
 		break;
 
 	case MODS_ESC_IRQ_HANDLED:
@@ -1009,10 +1249,16 @@ static long mods_krnl_ioctl(struct file  *fp,
 			   esc_mods_acpi_get_ddc_2, MODS_ACPI_GET_DDC_2);
 		break;
 
-#elif defined(CONFIG_ARCH_TEGRA)
+#elif defined(MODS_TEGRA)
 	case MODS_ESC_EVAL_ACPI_METHOD:
+		/* fallthrough */
 	case MODS_ESC_EVAL_DEV_ACPI_METHOD:
+		/* fallthrough */
+	case MODS_ESC_EVAL_DEV_ACPI_METHOD_2:
+		/* fallthrough */
 	case MODS_ESC_ACPI_GET_DDC:
+		/* fallthrough */
+	case MODS_ESC_ACPI_GET_DDC_2:
 		/* Silent failure on Tegra to avoid clogging kernel log */
 		ret = -EINVAL;
 		break;
@@ -1032,7 +1278,7 @@ static long mods_krnl_ioctl(struct file  *fp,
 				    esc_mods_set_driver_para, MODS_SET_PARA);
 		break;
 
-#ifdef CONFIG_ARCH_TEGRA
+#if defined(MODS_HAS_CLOCK)
 	case MODS_ESC_GET_CLOCK_HANDLE:
 		MODS_IOCTL(MODS_ESC_GET_CLOCK_HANDLE,
 			   esc_mods_get_clock_handle, MODS_GET_CLOCK_HANDLE);
@@ -1096,12 +1342,60 @@ static long mods_krnl_ioctl(struct file  *fp,
 				    esc_mods_clock_reset_deassert,
 				    MODS_CLOCK_HANDLE);
 		break;
-
+#endif
+#if defined(MODS_TEGRA)
 	case MODS_ESC_FLUSH_CPU_CACHE_RANGE:
 		MODS_IOCTL_NORETVAL(MODS_ESC_FLUSH_CPU_CACHE_RANGE,
 				    esc_mods_flush_cpu_cache_range,
 				    MODS_FLUSH_CPU_CACHE_RANGE);
 		break;
+	case MODS_ESC_DMA_ALLOC_COHERENT:
+		MODS_IOCTL(MODS_ESC_DMA_ALLOC_COHERENT,
+			   esc_mods_dma_alloc_coherent,
+			   MODS_DMA_COHERENT_MEM_HANDLE);
+		break;
+	case MODS_ESC_DMA_FREE_COHERENT:
+		MODS_IOCTL(MODS_ESC_DMA_FREE_COHERENT,
+			   esc_mods_dma_free_coherent,
+			   MODS_DMA_COHERENT_MEM_HANDLE);
+		break;
+	case MODS_ESC_DMA_COPY_TO_USER:
+		MODS_IOCTL(MODS_ESC_DMA_COPY_TO_USER,
+			   esc_mods_dma_copy_to_user,
+			   MODS_DMA_COPY_TO_USER);
+		break;
+#if defined(CONFIG_DMA_ENGINE)
+	case MODS_ESC_DMA_REQUEST_HANDLE:
+		MODS_IOCTL(MODS_ESC_DMA_REQUEST_HANDLE,
+			   esc_mods_dma_request_channel,
+			   MODS_DMA_HANDLE);
+		break;
+	case MODS_ESC_DMA_RELEASE_HANDLE:
+		MODS_IOCTL_NORETVAL(MODS_ESC_DMA_RELEASE_HANDLE,
+			   esc_mods_dma_release_channel,
+			   MODS_DMA_HANDLE);
+		break;
+	case MODS_ESC_DMA_ISSUE_PENDING:
+		MODS_IOCTL_NORETVAL(MODS_ESC_DMA_ISSUE_PENDING,
+				    esc_mods_dma_async_issue_pending,
+				    MODS_DMA_HANDLE);
+		break;
+	case MODS_ESC_DMA_SET_CONFIG:
+		MODS_IOCTL_NORETVAL(MODS_ESC_DMA_SET_CONFIG,
+				    esc_mods_dma_set_config,
+				    MODS_DMA_CHANNEL_CONFIG);
+		break;
+	case MODS_ESC_DMA_TX_SUBMIT:
+		MODS_IOCTL(MODS_ESC_DMA_TX_SUBMIT,
+			   esc_mods_dma_submit_request,
+			   MODS_DMA_TX_DESC);
+		break;
+	case MODS_ESC_DMA_TX_WAIT:
+		MODS_IOCTL(MODS_MODS_ESC_DMA_TX_WAIT,
+			   esc_mods_dma_wait,
+			   MODS_DMA_WAIT_DESC);
+		break;
+#endif
 #ifdef CONFIG_TEGRA_DC
 	case MODS_ESC_TEGRA_DC_CONFIG_POSSIBLE:
 		MODS_IOCTL(MODS_ESC_TEGRA_DC_CONFIG_POSSIBLE,
@@ -1114,13 +1408,19 @@ static long mods_krnl_ioctl(struct file  *fp,
 				    MODS_TEGRA_DC_SETUP_SD);
 		break;
 #endif
+#ifdef MODS_HAS_NET
+	case MODS_ESC_NET_FORCE_LINK:
+		MODS_IOCTL(MODS_ESC_NET_FORCE_LINK,
+			   esc_mods_net_force_link, MODS_NET_DEVICE_NAME);
+		break;
+#endif
 #endif
 	case MODS_ESC_MEMORY_BARRIER:
 		MODS_IOCTL_VOID(MODS_ESC_MEMORY_BARRIER,
 				esc_mods_memory_barrier);
 		break;
 
-#ifdef CONFIG_ARCH_TEGRA
+#ifdef MODS_TEGRA
 	case MODS_ESC_DMABUF_GET_PHYSICAL_ADDRESS:
 		MODS_IOCTL(MODS_ESC_DMABUF_GET_PHYSICAL_ADDRESS,
 			   esc_mods_dmabuf_get_phys_addr,
@@ -1149,6 +1449,11 @@ static long mods_krnl_ioctl(struct file  *fp,
 				    MODS_ADSP_RUN_APP_INFO);
 		break;
 #endif
+	case MODS_ESC_GET_SCREEN_INFO:
+		MODS_IOCTL(MODS_ESC_GET_SCREEN_INFO,
+			   esc_mods_get_screen_info, MODS_SCREEN_INFO);
+		break;
+
 	default:
 		mods_error_printk("unrecognized ioctl (0x%x)\n", cmd);
 		ret = -EINVAL;

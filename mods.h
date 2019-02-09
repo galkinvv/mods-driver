@@ -1,7 +1,7 @@
 /*
  * mods.h - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2008-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2008-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -24,7 +24,7 @@
 
 /* Driver version */
 #define MODS_DRIVER_VERSION_MAJOR 3
-#define MODS_DRIVER_VERSION_MINOR 56
+#define MODS_DRIVER_VERSION_MINOR 66
 #define MODS_DRIVER_VERSION ((MODS_DRIVER_VERSION_MAJOR << 8) | \
 			     ((MODS_DRIVER_VERSION_MINOR/10) << 4) | \
 			     (MODS_DRIVER_VERSION_MINOR%10))
@@ -46,6 +46,21 @@ struct mods_pci_dev {
 	__u16 bus;
 	__u8  device;
 	__u8  function;
+};
+
+/* MODS_ESC_SET_PPC_TCE_BYPASS */
+#define MODS_PPC_TCE_BYPASS_DEFAULT  0
+#define MODS_PPC_TCE_BYPASS_ON       1
+#define MODS_PPC_TCE_BYPASS_OFF      2
+struct MODS_SET_PPC_TCE_BYPASS {
+	/* IN */
+	__u8                  mode;
+	__u8                  _dummy_align[7];
+	struct mods_pci_dev_2 pci_device;
+	__u64	              device_dma_mask;
+
+	/* OUT */
+	__u64	              dma_base_address;
 };
 
 /* MODS_ESC_ALLOC_PAGES */
@@ -102,6 +117,17 @@ struct MODS_GET_PHYSICAL_ADDRESS {
 	__u64	physical_address;
 };
 
+/* MODS_ESC_GET_PHYSICAL_ADDRESS */
+struct MODS_GET_PHYSICAL_ADDRESS_2 {
+	/* IN */
+	__u64                 memory_handle;
+	__u32	              offset;
+	struct mods_pci_dev_2 pci_device;
+
+	/* OUT */
+	__u64                 physical_address;
+};
+
 /* MODS_ESC_VIRTUAL_TO_PHYSICAL */
 struct MODS_VIRTUAL_TO_PHYSICAL {
 	/* IN */
@@ -130,6 +156,13 @@ struct MODS_FLUSH_CPU_CACHE_RANGE {
 	__u64 virt_addr_start;
 	__u64 virt_addr_end;
 	__u32 flags;
+};
+
+/* MODS_ESC_DMA_MAP_MEMORY */
+struct MODS_DMA_MAP_MEMORY {
+	/* IN */
+	__u64                 memory_handle;
+	struct mods_pci_dev_2 pci_device;
 };
 
 /* MODS_ESC_FIND_PCI_DEVICE_2 */
@@ -262,10 +295,35 @@ struct MODS_PCI_WRITE {
 	__u32	data_size;
 };
 
+/* MODS_ESC_PCI_HOT_RESET */
+struct MODS_PCI_HOT_RESET {
+	/* IN */
+	struct mods_pci_dev_2 pci_device;
+};
+
 /* MODS_ESC_PCI_BUS_ADD_DEVICES*/
 struct MODS_PCI_BUS_ADD_DEVICES {
 	/* IN */
 	__u32	 bus;
+};
+
+/* MODS_ESC_PCI_MAP_RESOURCE */
+struct MODS_PCI_MAP_RESOURCE {
+	/* IN */
+	struct mods_pci_dev_2 local_pci_device;
+	struct mods_pci_dev_2 remote_pci_device;
+	__u32                 resource_index;
+	__u64                 page_count;
+
+	/* IN/OUT */
+	__u64                 va;
+};
+
+/* MODS_ESC_PCI_UNMAP_RESOURCE */
+struct MODS_PCI_UNMAP_RESOURCE {
+	/* IN */
+	struct mods_pci_dev_2 pci_device;
+	__u64                 va;
 };
 
 /* MODS_ESC_PIO_READ */
@@ -312,6 +370,31 @@ struct MODS_IRQ {
 	/* OUT */
 	struct mods_irq_status stat;	/* for querying irq */
 	__u64		 phys;	/* the memory physical address */
+};
+#define MODS_IRQ_MAX_MASKS 16
+
+/* MODS_ESC_REGISTER_IRQ_3 */
+struct mods_mask_info2 {
+	__u8	mask_type;  /*mask type 32/64 bit access*/
+	__u8	reserved[7]; /*force 64bit alignment */
+	__u32	irq_pending_offset; /* register to read IRQ pending status*/
+	__u32   irq_enabled_offset; /* register to read IRQ enabled status */
+	__u32   irq_enable_offset;  /* register to write to enable IRQs */
+	__u32   irq_disable_offset; /* register to write to disable IRQs */
+	__u64	and_mask;   /*and mask for clearing bits in this register */
+	__u64	or_mask;    /*or mask for setting bit in this register */
+};
+
+struct MODS_REGISTER_IRQ_3 {
+	/* IN */
+	struct	mods_pci_dev_2 dev; /* device identifying interrupt for */
+				    /* which the mask will be applied */
+	__u64	aperture_addr;	    /* physical address of aperture */
+	__u32	aperture_size;	    /* size of the mapped region */
+	__u32	mask_info_cnt;	    /* number of entries in mask_info[]*/
+	struct	mods_mask_info2 mask_info[MODS_IRQ_MAX_MASKS];
+	__u8	irq_type;	    /* MODS_IRQ_TYPE_* */
+	__u8	reserved[7];	    /* keep alignment to 64bits */
 };
 
 /* MODS_ESC_REGISTER_IRQ_2 */
@@ -368,6 +451,26 @@ struct MODS_QUERY_IRQ {
 #define MODS_IRQ_TYPE_MSI  1
 #define MODS_IRQ_TYPE_CPU  2
 
+/* MODS_ESC_SET_IRQ_MULTIMASK */
+struct mods_mask_info {
+	__u8	mask_type;  /*mask type 32/64 bit access*/
+	__u8	reserved[3];
+	__u32	reg_offset; /* offset of register within the bar aperture*/
+	__u64	and_mask;   /*and mask for clearing bits in this register */
+	__u64	or_mask;    /*or value for setting bit in this register */
+};
+struct MODS_SET_IRQ_MULTIMASK {
+	/* IN */
+	__u64	aperture_addr;	    /* physical address of aperture */
+	__u32	aperture_size;	    /* size of the mapped region */
+	struct	mods_pci_dev_2 dev; /* device identifying interrupt for */
+				    /* which the mask will be applied */
+	__u32	mask_info_cnt;	    /* number of entries in mask_info[]*/
+	struct	mods_mask_info mask_info[MODS_IRQ_MAX_MASKS];
+	__u8	irq_type;	    /* irq type */
+};
+
+
 /* MODS_ESC_SET_IRQ_MASK_2 */
 struct MODS_SET_IRQ_MASK_2 {
 	/* IN */
@@ -403,7 +506,8 @@ struct MODS_SET_IRQ_MASK {
 	__u8		    mask_type;	   /* mask type */
 };
 
-#define MODS_MASK_TYPE_IRQ_DISABLE 0
+#define MODS_MASK_TYPE_IRQ_DISABLE      0
+#define MODS_MASK_TYPE_IRQ_DISABLE64    1
 
 #define ACPI_MODS_TYPE_INTEGER		1
 #define ACPI_MODS_TYPE_BUFFER		2
@@ -668,6 +772,107 @@ struct MODS_ADSP_RUN_APP_INFO {
 	__u32 timeout;
 };
 
+/* MODS_ESC_GET_SCREEN_INFO */
+struct MODS_SCREEN_INFO {
+	/* OUT */
+	__u8  orig_video_mode;
+	__u8  orig_video_is_vga;
+	__u16 lfb_width;
+	__u16 lfb_height;
+	__u16 lfb_depth;
+	__u32 lfb_base;
+	__u32 lfb_size;
+	__u16 lfb_linelength;
+};
+
+struct MODS_DMA_HANDLE {
+	/* OUT */
+	__u32	dma_id; /* Inditify for the DMA */
+};
+
+enum MODS_DMA_TRANSFER_DIRECTION {
+	MODS_DMA_MEM_TO_MEM,
+	MODS_DMA_MEM_TO_DEV,
+	MODS_DMA_DEV_TO_MEM,
+	MODS_DMA_DEV_TO_DEV,
+	MODS_DMA_TRANS_NONE,
+};
+
+enum MODS_DMA_BUSWIDTH {
+	MODS_DMA_BUSWIDTH_UNDEFINED = 0,
+	MODS_DMA_BUSWIDTH_1_BYTE = 1,
+	MODS_DMA_BUSWIDTH_2_BYTES = 2,
+	MODS_DMA_BUSWIDTH_4_BYTES = 4,
+	MODS_DMA_BUSWIDTH_8_BYTES = 8,
+};
+
+struct MODS_DMA_CHANNEL_CONFIG {
+	__u64 src_addr;
+	__u64 dst_addr;
+	struct MODS_DMA_HANDLE handle;
+	__u32 direction;
+	__u32 src_addr_width;
+	__u32 dst_addr_width;
+	__u32 src_maxburst;
+	__u32 dst_maxburst;
+	__u32 slave_id;
+	__u32 device_fc;
+};
+
+/* Node: Only support SINGLE MODS so far*/
+enum MODS_DMA_TX_MODE {
+	MODS_DMA_SINGLE = 0,
+	MODS_DMA_CYCLIC,
+	MODS_DMA_INTERLEAVED, /* Common to Slave as well as M2M clients. */
+};
+
+typedef __s32 mods_dma_cookie_t;
+
+struct MODS_DMA_TX_DESC	{
+	/* IN */
+	__u64 phys;
+	__u64 phys_2; /* only valid for MEMCPY */
+	struct MODS_DMA_HANDLE handle;
+	__u32 mode;
+	__u32 data_dir;
+	__u32 length;
+	__u32 flags;
+	/* OUT */
+	mods_dma_cookie_t cookie;
+};
+
+enum MODS_DMA_WAIT_TYPE {
+	MODS_DMA_SYNC_WAIT,	/* wait until finished */
+	MODS_DMA_ASYNC_WAIT, /* just check tx status */
+};
+
+struct MODS_DMA_WAIT_DESC {
+	struct MODS_DMA_HANDLE handle;
+	mods_dma_cookie_t cookie;
+	__u32 type;
+	/* OUT */
+	__u32 tx_complete;
+};
+
+#define MAX_NET_DEVICE_NAME_LENGTH 16
+struct MODS_NET_DEVICE_NAME {
+	/* in */
+	char device_name[MAX_NET_DEVICE_NAME_LENGTH];
+};
+struct MODS_DMA_COHERENT_MEM_HANDLE {
+	__u32	num_bytes;
+	__u32	attrib;
+	__u64	memory_handle_phys;
+	__u64	memory_handle_virt;
+};
+
+/* MODS_ESC_DMA_COPY_TO_USER */
+struct MODS_DMA_COPY_TO_USER {
+	__u32	num_bytes;
+	__u32	attrib;
+	__u64	memory_handle_src;
+	__u64	memory_handle_dst;
+};
 #pragma pack(pop)
 
 /* ************************************************************************* */
@@ -823,5 +1028,48 @@ struct MODS_ADSP_RUN_APP_INFO {
 		   _IOWR(MODS_IOC_MAGIC, 70, struct MODS_DEVICE_NUMA_INFO_2)
 #define MODS_ESC_ACPI_GET_DDC_2			\
 		   _IOWR(MODS_IOC_MAGIC, 71, struct MODS_ACPI_GET_DDC_2)
-
+#define MODS_ESC_GET_SCREEN_INFO			\
+		    _IOR(MODS_IOC_MAGIC, 72, struct MODS_SCREEN_INFO)
+#define MODS_ESC_PCI_HOT_RESET			\
+		    _IOW(MODS_IOC_MAGIC, 73, struct MODS_PCI_HOT_RESET)
+#define MODS_ESC_SET_PPC_TCE_BYPASS			\
+		    _IOWR(MODS_IOC_MAGIC, 74, struct MODS_SET_PPC_TCE_BYPASS)
+#define MODS_ESC_DMA_MAP_MEMORY			\
+		    _IOW(MODS_IOC_MAGIC, 75, struct MODS_DMA_MAP_MEMORY)
+#define MODS_ESC_DMA_UNMAP_MEMORY			\
+		    _IOW(MODS_IOC_MAGIC, 76, struct MODS_DMA_MAP_MEMORY)
+#define MODS_ESC_GET_MAPPED_PHYSICAL_ADDRESS_2			\
+		    _IOWR(MODS_IOC_MAGIC, 77,                   \
+			  struct MODS_GET_PHYSICAL_ADDRESS_2)
+#define MODS_ESC_PCI_MAP_RESOURCE			\
+		    _IOWR(MODS_IOC_MAGIC, 78, struct MODS_PCI_MAP_RESOURCE)
+#define MODS_ESC_PCI_UNMAP_RESOURCE			\
+		    _IOW(MODS_IOC_MAGIC, 79, struct MODS_PCI_UNMAP_RESOURCE)
+#define MODS_ESC_DMA_REQUEST_HANDLE		\
+		   _IOR(MODS_IOC_MAGIC,  80, struct MODS_DMA_HANDLE)
+#define MODS_ESC_DMA_RELEASE_HANDLE		\
+		   _IOW(MODS_IOC_MAGIC,  81, struct MODS_DMA_HANDLE)
+#define MODS_ESC_DMA_SET_CONFIG			\
+		   _IOW(MODS_IOC_MAGIC,  82, struct MODS_DMA_CHANNEL_CONFIG)
+#define MODS_ESC_DMA_TX_SUBMIT			\
+		   _IOW(MODS_IOC_MAGIC,  83, struct MODS_DMA_TX_DESC)
+#define MODS_ESC_DMA_TX_WAIT			\
+		   _IOWR(MODS_IOC_MAGIC, 84, struct MODS_DMA_WAIT_DESC)
+#define MODS_ESC_DMA_ISSUE_PENDING		\
+		   _IOW(MODS_IOC_MAGIC,  85, struct MODS_DMA_HANDLE)
+#define MODS_ESC_SET_IRQ_MULTIMASK			\
+		    _IOW(MODS_IOC_MAGIC, 86, struct MODS_SET_IRQ_MULTIMASK)
+#define MODS_ESC_NET_FORCE_LINK			\
+		    _IOW(MODS_IOC_MAGIC, 87, struct MODS_NET_DEVICE_NAME)
+#define MODS_ESC_REGISTER_IRQ_3			\
+		    _IOW(MODS_IOC_MAGIC, 88, struct MODS_REGISTER_IRQ_3)
+#define MODS_ESC_DMA_ALLOC_COHERENT			\
+		   _IOWR(MODS_IOC_MAGIC, 89,		\
+		   struct MODS_DMA_COHERENT_MEM_HANDLE)
+#define MODS_ESC_DMA_FREE_COHERENT			\
+		   _IOWR(MODS_IOC_MAGIC, 90,		\
+		   struct MODS_DMA_COHERENT_MEM_HANDLE)
+#define MODS_ESC_DMA_COPY_TO_USER			\
+		   _IOWR(MODS_IOC_MAGIC, 91,		\
+		   struct MODS_DMA_COPY_TO_USER)
 #endif /* _MODS_H_  */

@@ -1,7 +1,7 @@
 /*
  * mods_config.h - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2008-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2008-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -51,16 +51,38 @@
 #	define MODS_HAS_NEW_ACPI_WALK 1
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 13, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
 #	define MODS_HAS_NEW_ACPI_HANDLE 1
 #endif
 
 #undef MODS_HAS_KFUSE
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0) && defined(CONFIG_ARCH_TEGRA) && defined(CONFIG_DMA_SHARED_BUFFER)
+#if defined(CONFIG_ARCH_TEGRA) || defined(CONFIG_PLATFORM_TEGRA)
+#	define MODS_TEGRA 1
+#endif
+
+#if defined(CONFIG_ARCH_TEGRA) || defined(CONFIG_TEGRA_CLK_FRAMEWORK)
+#	define MODS_HAS_CLOCK 1
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0) && defined(MODS_TEGRA) && defined(CONFIG_DMA_SHARED_BUFFER)
 #	define MODS_HAS_DMABUF 1
 #endif
 
+#if defined(CONFIG_PPC64)
+#	define MODS_HAS_SET_PPC_TCE_BYPASS 1
+#endif
+
 #define MODS_MULTI_INSTANCE_DEFAULT_VALUE 0
+
+#undef MODS_HAS_NET
+
+#if defined(CONFIG_ZONE_DMA32)
+#	define MODS_HAS_DMA32
+#endif
+
+#if defined(CONFIG_PCI) && LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 25)
+#	define MODS_CAN_REGISTER_PCI_DEV 1
+#endif
 
 #endif /* _MODS_CONFIG_H_  */

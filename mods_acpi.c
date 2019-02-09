@@ -1,7 +1,7 @@
 /*
  * mods_acpi.c - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2008-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2008-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -20,6 +20,7 @@
 #include "mods_internal.h"
 
 #include <linux/acpi.h>
+#include <linux/device.h>
 #include <acpi/acpi.h>
 #include <acpi/acpi_bus.h>
 
