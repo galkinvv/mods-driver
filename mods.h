@@ -1,465 +1,827 @@
 /*
  * mods.h - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright 2008-2011 NVIDIA Corporation.
+ * Copyright (c) 2008-2014, NVIDIA CORPORATION.  All rights reserved.
  *
- * NVIDIA MODS kernel driver is free software: you can redistribute it
- * and/or modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation, either version 2 of the
- * License, or (at your option) any later version.
+ * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
  *
- * NVIDIA MODS kernel driver is distributed in the hope that it will be
- * useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
- * Public License for more details.
+ * NVIDIA MODS kernel driver is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with NVIDIA MODS kernel driver.  If not, see
- * <http://www.gnu.org/licenses/>.
- *
+ * You should have received a copy of the GNU General Public License
+ * along with NVIDIA MODS kernel driver.
+ * If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef _MODS_H_
 #define _MODS_H_
 
-#include <linux/module.h>
-#include <linux/init.h>         /*  module_init, module_exit        */
-#include <asm/uaccess.h>        /*  copy_from_user, copy_to_user    */
-#include <linux/pci.h>          /*  pci_find_class, etc             */
-#include <linux/poll.h>         /*  poll and select                 */
-#include <asm/io.h>             /*  port READ/WRITE operation       */
-#include <linux/fs.h>
-#include <linux/fcntl.h>
-#include <linux/kernel.h>
-#include <linux/list.h>
-#include <linux/netdevice.h>
-#include <linux/etherdevice.h>
-#include <linux/netfilter.h>
-#include <linux/version.h>
-#include <linux/miscdevice.h>
-#include <linux/pagemap.h>
+#include <linux/types.h>
 
-#define     NvU8    u8
-#define     NvU16   u16
-#define     NvU32   u32
-#define     NvU64   u64
+/* Driver version */
+#define MODS_DRIVER_VERSION_MAJOR 3
+#define MODS_DRIVER_VERSION_MINOR 56
+#define MODS_DRIVER_VERSION ((MODS_DRIVER_VERSION_MAJOR << 8) | \
+			     ((MODS_DRIVER_VERSION_MINOR/10) << 4) | \
+			     (MODS_DRIVER_VERSION_MINOR%10))
 
-#include "driverAPI.h"
+#pragma pack(push, 1)
 
-#ifndef true
-#define true    1
-#define false   0
-#endif
+/* ************************************************************************* */
+/* ** ESCAPE INTERFACE STRUCTURE					     */
+/* ************************************************************************* */
 
-/* function return code */
-#define OK       0
-#define ERROR   -1
-
-#define IRQ_FOUND       1
-#define IRQ_NOT_FOUND   0
-
-#define DEV_FOUND       1
-#define DEV_NOT_FOUND   0
-
-#define MSI_DEV_FOUND        1
-#define MSI_DEV_NOT_FOUND    0
-
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,18)
-#define IRQF_SHARED SA_SHIRQ
-#endif
-
-typedef struct _def_sys_page_table
-{
-    NvU64   phys_addr;
-    NvU64   k_virtual_addr;
-} SYS_PAGE_TABLE, *PSYS_PAGE_TABLE;
-
-struct en_dev_entry
-{
-    struct pci_dev      *dev;
-    struct en_dev_entry *next;
+struct mods_pci_dev_2 {
+	__u16 domain;
+	__u16 bus;
+	__u16 device;
+	__u16 function;
 };
 
-struct mem_type
-{
-    NvU64 phys_addr;
-    NvU64 size;
-    NvU32 type;
+struct mods_pci_dev {
+	__u16 bus;
+	__u8  device;
+	__u8  function;
 };
 
-/* file private data */
-typedef struct
-{
-    struct list_head    *mods_alloc_list;
-    struct list_head    *mods_mapping_list;
-    wait_queue_head_t   interrupt_event;
-    struct en_dev_entry *enabled_devices;
-    int                 mods_id;
-    struct mem_type     mem_type;
-} mods_file_private_data;
+/* MODS_ESC_ALLOC_PAGES */
+struct MODS_ALLOC_PAGES {
+	/* IN */
+	__u32	num_bytes;
+	__u32	contiguous;
+	__u32	address_bits;
+	__u32	attrib;
 
-/* VM private data */
-typedef struct
-{
-    struct file    *fp;
-    atomic_t        usageCount;
-
-} mods_vm_private_data;
-
-/* system memory allocation tracking */
-typedef struct _def_sys_mem_mods_info
-{
-    NvU32 contiguous;
-
-    /* tells how the memory is cached:
-     * (MODS_MEMORY_CACHED, MODS_MEMORY_UNCACHED, MODS_MEMORY_WRITECOMBINE)
-     */
-    NvU32 cache_type;
-
-    NvU32 length;    /* actual number of bytes allocated */
-    NvU32 order;     /* 2^Order pages allocated for contiguous allocation */
-    NvU32 num_pages; /* number of allocated pages */
-    NvU32 k_mapping_ref_cnt;
-
-    NvU32 addr_bits;
-    struct page *p_page;
-    NvU64 logical_addr; /* kernel logical address */
-    NvU64 phys_addr;    /* physical address, for contiguous allocation */
-
-    /* keeps information about allocated pages for noncontiguous allocation */
-    SYS_PAGE_TABLE **p_page_tbl;
-
-    struct list_head    list;
-} SYS_MEM_MODS_INFO, *PSYS_MEM_MODS_INFO;
-
-/* map memory tracking */
-typedef struct _def_sys_map_mods_info
-{
-    NvU32 contiguous;
-    NvU64 phys_addr;      /* first physical address of given mapping */
-    NvU64 virtual_addr;   /* virtual address of given mapping */
-    NvU32 mapping_length; /* tells how many bytes were mapped */
-
-    /* helps to unmap noncontiguous memory, NULL for contiguous */
-    PSYS_MEM_MODS_INFO p_mem_info;
-
-    struct list_head list;
-} SYS_MAP_MEMORY, *PSYS_MAP_MEMORY;
-
-
-/* functions used to avoid global debug variables */
-int mods_check_debug_level(int);
-int mods_get_mem4g(void);
-int mods_get_highmem4g(void);
-void mods_set_highmem4g(int);
-int mods_get_multi_instance(void);
-int mods_get_mem4goffset(void);
-
-#define IRQ_MAX             256+PCI_IRQ_MAX
-#define PCI_IRQ_MAX         15
-#define MODS_CHANNEL_MAX    32
-
-/* msi */
-#define PCI_MSI_FLAGS       2
-#define PCI_MSI_FLAGS_64BIT 0x80
-#define PCI_MSI_DATA_64     12
-#define PCI_MSI_MASK_BIT    16
-#define MSI_CONTROL_REG(base)       (base + PCI_MSI_FLAGS)
-#define IS_64BIT_ADDRESS(control)   (!!(control & PCI_MSI_FLAGS_64BIT))
-#define MSI_DATA_REG(base, is64bit) \
-    ((is64bit == 1) ? base + PCI_MSI_DATA_64 : base + PCI_MSI_DATA_32)
-
-#define IRQ_VAL_POISON      0xfafbfcfdU
-
-/* debug print masks */
-#define DEBUG_IOCTL         0x2
-#define DEBUG_PCICFG        0x4
-#define DEBUG_ACPI          0x8
-#define DEBUG_ISR           0x10
-#define DEBUG_MEM           0x20
-#define DEBUG_FUNC          0x40
-#define DEBUG_CLOCK         0x80
-#define DEBUG_DETAILED      0x100
-#define DEBUG_ISR_DETAILED  (DEBUG_ISR | DEBUG_DETAILED)
-#define DEBUG_MEM_DETAILED  (DEBUG_MEM | DEBUG_DETAILED)
-
-#define LOG_ENT() mods_debug_printk(DEBUG_FUNC, "> %s\n", __FUNCTION__)
-#define LOG_EXT() mods_debug_printk(DEBUG_FUNC, "< %s\n", __FUNCTION__)
-#define LOG_ENT_C(format, args...) \
-    mods_debug_printk(DEBUG_FUNC, "> %s: " format, __FUNCTION__, ##args)
-#define LOG_EXT_C(format, args...) \
-    mods_debug_printk(DEBUG_FUNC, "< %s: " format, __FUNCTION__, ##args)
-
-#define mods_debug_printk(level, fmt, args...)\
-    (void)(mods_check_debug_level(level) && \
-           printk(KERN_DEBUG "mods debug: " fmt, ##args))
-
-#define mods_info_printk(fmt, args...)\
-    printk(KERN_INFO "mods: " fmt, ##args)
-
-#define mods_error_printk(fmt, args...)\
-    printk(KERN_ERR "mods error: " fmt, ##args)
-
-#define mods_warning_printk(fmt, args...)\
-    printk(KERN_WARNING "mods warning: " fmt, ##args)
-
-#define assert(expr) do {                               \
-    if (!(expr)) {                                      \
-        printk(KERN_CRIT "mods: BUG in %s:%d: %s\n",           \
-                __FILE__, __LINE__, __FUNCTION__);      \
-        BUG();                                          \
-    }                                                   \
-} while (0)
-
-struct irq_q_data
-{
-    NvU32               time;
-    struct pci_dev     *dev;
-    NvU32               irq;
+	/* OUT */
+	__u64	memory_handle;
 };
 
-struct irq_q_info
-{
-    struct irq_q_data   data[MODS_MAX_IRQS];
-    NvU32               head;
-    NvU32               tail;
+/* MODS_ESC_DEVICE_ALLOC_PAGES_2 */
+struct MODS_DEVICE_ALLOC_PAGES_2 {
+	/* IN */
+	__u32			num_bytes;
+	__u32			contiguous;
+	__u32			address_bits;
+	__u32			attrib;
+	struct mods_pci_dev_2 pci_device;
+
+	/* OUT */
+	__u64			memory_handle;
 };
 
-struct dev_irq_map
-{
-    NvU32              *dev_irq_enabled;
-    NvU32              *dev_irq_state;
-    NvU32               apic_irq;
-    NvU8                type;
-    NvU8                channel;
-    struct pci_dev     *dev;
-    struct list_head    list;
+/* MODS_ESC_DEVICE_ALLOC_PAGES */
+struct MODS_DEVICE_ALLOC_PAGES {
+	/* IN */
+	__u32		    num_bytes;
+	__u32		    contiguous;
+	__u32		    address_bits;
+	__u32		    attrib;
+	struct mods_pci_dev pci_device;
+
+	/* OUT */
+	__u64		    memory_handle;
 };
 
-struct mods_priv
-{
-    /* map info from pci irq to apic irq */
-    struct list_head    irq_head[MODS_CHANNEL_MAX];
-
-    /* bits map for each allocated id. Each mods has an id. */
-    /* the design is to take  into  account multi mods. */
-    unsigned long       channel_flags;
-
-    /* fifo loop queue */
-    struct irq_q_info   rec_info[MODS_CHANNEL_MAX];
-    spinlock_t          lock;
+/* MODS_ESC_FREE_PAGES */
+struct MODS_FREE_PAGES {
+	/* IN */
+	__u64	memory_handle;
 };
 
+/* MODS_ESC_GET_PHYSICAL_ADDRESS */
+struct MODS_GET_PHYSICAL_ADDRESS {
+	/* IN */
+	__u64	memory_handle;
+	__u32	offset;
 
+	/* OUT */
+	__u64	physical_address;
+};
 
-/* *************************************************************************** */
-/* *************************************************************************** */
-/* **                                                                          */
-/* ** SYSTEM CALLS                                                             */
-/* **                                                                          */
-/* *************************************************************************** */
-/* *************************************************************************** */
+/* MODS_ESC_VIRTUAL_TO_PHYSICAL */
+struct MODS_VIRTUAL_TO_PHYSICAL {
+	/* IN */
+	__u64	virtual_address;
 
+	/* OUT */
+	__u64	physical_address;
+};
 
-/* MEMORY */
-#define MODS_KMALLOC(ptr, size)                               \
-    {                                                        \
-        (ptr) = kmalloc(size, GFP_KERNEL);                   \
-        MODS_ALLOC_RECORD(ptr, size, "km_alloc");             \
-    }
+/* MODS_ESC_PHYSICAL_TO_VIRTUAL */
+struct MODS_PHYSICAL_TO_VIRTUAL {
+	/* IN */
+	__u64	physical_address;
 
-#define MODS_KMALLOC_ATOMIC(ptr, size)                        \
-    {                                                        \
-        (ptr) = kmalloc(size, GFP_ATOMIC);                   \
-        MODS_ALLOC_RECORD(ptr, size, "km_alloc_atomic");      \
-    }
+	/* OUT */
+	__u64	virtual_address;
 
-#define MODS_KFREE(ptr, size)                                 \
-    {                                                        \
-        MODS_FREE_RECORD(ptr, size, "km_free");               \
-        kfree((void *) (ptr));                               \
-    }
+};
 
-#define MODS_ALLOC_RECORD(ptr, size, name)                    \
-    if (ptr != NULL)                                         \
-    {                                                        \
-        mods_add_mem(ptr, size, __FILE__, __LINE__);          \
-    }
+/* MODS_ESC_FLUSH_CACHE_RANGE */
+#define MODS_FLUSH_CPU_CACHE	  1
+#define MODS_INVALIDATE_CPU_CACHE 2
 
-#define MODS_FREE_RECORD(ptr, size, name)                     \
-    if (ptr != NULL)                                         \
-    {                                                        \
-        mods_del_mem(ptr, size, __FILE__, __LINE__);          \
-    }
+struct MODS_FLUSH_CPU_CACHE_RANGE {
+	/* IN */
+	__u64 virt_addr_start;
+	__u64 virt_addr_end;
+	__u32 flags;
+};
 
-#define MEMDBG_ALLOC(a,b)       (a = kmalloc(b, GFP_ATOMIC))
-#define MEMDBG_FREE(a)          (kfree(a))
-#define MODS_FORCE_KFREE(ptr)    (kfree(ptr))
+/* MODS_ESC_FIND_PCI_DEVICE_2 */
+struct MODS_FIND_PCI_DEVICE_2 {
+	/* IN */
+	__u32	device_id;
+	__u32	vendor_id;
+	__u32	index;
 
-#define MODS_GET_FREE_PAGES(ptr, order, gfp_mask)             \
-    {                                                        \
-        (ptr) = __get_free_pages(gfp_mask, order);           \
-    }
+	/* OUT */
+	struct mods_pci_dev_2 pci_device;
+};
 
-#define MODS_FREE_PAGES(ptr, order)                           \
-    {                                                        \
-        free_pages(ptr, order);                              \
-    }
+/* MODS_ESC_FIND_PCI_DEVICE */
+struct MODS_FIND_PCI_DEVICE {
+	/* IN */
+	__u32	  device_id;
+	__u32	  vendor_id;
+	__u32	  index;
 
-#define __MODS_ALLOC_PAGES(page, order, gfp_mask)              \
-    {                                                       \
-        (page) = alloc_pages(gfp_mask, order);              \
-    }
+	/* OUT */
+	__u32	  bus_number;
+	__u32	  device_number;
+	__u32	  function_number;
+};
 
-#define __MODS_FREE_PAGES(page, order)                        \
-    {                                                        \
-        __free_pages(page, order);                           \
-    }
+/* MODS_ESC_FIND_PCI_CLASS_CODE_2 */
+struct MODS_FIND_PCI_CLASS_CODE_2 {
+	/* IN */
+	__u32	class_code;
+	__u32	index;
 
-#ifdef CONFIG_ARM
-#   define MODS_SET_MEMORY_UC(addr, pages) 0
-#   define MODS_SET_MEMORY_WC(addr, pages) 0
-#   define MODS_SET_MEMORY_WB(addr, pages) 0
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(2,6,25)
-#   define MODS_SET_MEMORY_UC(addr, pages) change_page_attr(virt_to_page(addr), pages, PAGE_KERNEL_NOCACHE)
-#   define MODS_SET_MEMORY_WC MODS_SET_MEMORY_UC
-#   define MODS_SET_MEMORY_WB(addr, pages) change_page_attr(virt_to_page(addr), pages, PAGE_KERNEL)
+	/* OUT */
+	struct mods_pci_dev_2 pci_device;
+};
+
+/* MODS_ESC_FIND_PCI_CLASS_CODE */
+struct MODS_FIND_PCI_CLASS_CODE {
+	/* IN */
+	__u32	class_code;
+	__u32	index;
+
+	/* OUT */
+	__u32	bus_number;
+	__u32	device_number;
+	__u32	function_number;
+};
+
+/* MODS_ESC_PCI_GET_BAR_INFO_2 */
+struct MODS_PCI_GET_BAR_INFO_2 {
+	/* IN */
+	struct mods_pci_dev_2 pci_device;
+	__u32			bar_index;
+
+	/* OUT */
+	__u64 base_address;
+	__u64 bar_size;
+};
+
+/* MODS_ESC_PCI_GET_BAR_INFO */
+struct MODS_PCI_GET_BAR_INFO {
+	/* IN */
+	struct mods_pci_dev pci_device;
+	__u32		    bar_index;
+
+	/* OUT */
+	__u64 base_address;
+	__u64 bar_size;
+};
+
+/* MODS_ESC_PCI_GET_IRQ_2 */
+struct MODS_PCI_GET_IRQ_2 {
+	/* IN */
+	struct mods_pci_dev_2 pci_device;
+
+	/* OUT */
+	__u32 irq;
+};
+
+/* MODS_ESC_PCI_GET_IRQ */
+struct MODS_PCI_GET_IRQ {
+	/* IN */
+	struct mods_pci_dev pci_device;
+
+	/* OUT */
+	__u32 irq;
+};
+
+/* MODS_ESC_PCI_READ_2 */
+struct MODS_PCI_READ_2 {
+	/* IN */
+	struct mods_pci_dev_2 pci_device;
+	__u32			address;
+	__u32			data_size;
+
+	/* OUT */
+	__u32			data;
+};
+
+/* MODS_ESC_PCI_READ */
+struct MODS_PCI_READ {
+	/* IN */
+	__u32	bus_number;
+	__u32	device_number;
+	__u32	function_number;
+	__u32	address;
+	__u32	data_size;
+
+	/* OUT */
+	__u32	 data;
+};
+
+/* MODS_ESC_PCI_WRITE_2 */
+struct MODS_PCI_WRITE_2 {
+	/* IN */
+	struct mods_pci_dev_2 pci_device;
+	__u32			address;
+	__u32			data;
+	__u32			data_size;
+};
+
+/* MODS_ESC_PCI_WRITE */
+struct MODS_PCI_WRITE {
+	/* IN */
+	__u32	bus_number;
+	__u32	device_number;
+	__u32	function_number;
+	__u32	address;
+	__u32	data;
+	__u32	data_size;
+};
+
+/* MODS_ESC_PCI_BUS_ADD_DEVICES*/
+struct MODS_PCI_BUS_ADD_DEVICES {
+	/* IN */
+	__u32	 bus;
+};
+
+/* MODS_ESC_PIO_READ */
+struct MODS_PIO_READ {
+	/* IN */
+	__u16	port;
+	__u32	data_size;
+
+	/* OUT */
+	__u32	data;
+};
+
+/* MODS_ESC_PIO_WRITE */
+struct MODS_PIO_WRITE {
+	/* IN */
+	__u16	port;
+	__u32	data;
+	__u32	data_size;
+};
+
+#define INQ_CNT 8
+
+struct mods_irq_data {
+	__u32 irq;
+	__u32 delay;
+};
+
+struct mods_irq_status {
+	struct mods_irq_data data[INQ_CNT];
+	__u32 irqbits:INQ_CNT;
+	__u32 otherirq:1;
+};
+
+/* MODS_ESC_IRQ */
+struct MODS_IRQ {
+	/* IN */
+	__u32 cmd;
+	__u32 size;		/* memory size */
+	__u32 irq;		/* the irq number to be registered in driver */
+
+	/* IN OUT */
+	__u32 channel;		/* application id allocated by driver. */
+
+	/* OUT */
+	struct mods_irq_status stat;	/* for querying irq */
+	__u64		 phys;	/* the memory physical address */
+};
+
+/* MODS_ESC_REGISTER_IRQ_2 */
+/* MODS_ESC_UNREGISTER_IRQ_2 */
+/* MODS_ESC_IRQ_HANDLED_2 */
+struct MODS_REGISTER_IRQ_2 {
+	/* IN */
+	struct mods_pci_dev_2 dev;  /* device which generates the interrupt */
+	__u8			type; /* MODS_IRQ_TYPE_* */
+};
+
+/* MODS_ESC_REGISTER_IRQ */
+/* MODS_ESC_UNREGISTER_IRQ */
+/* MODS_ESC_IRQ_HANDLED */
+struct MODS_REGISTER_IRQ {
+	/* IN */
+	struct mods_pci_dev dev;   /* device which generates
+				      the interrupt */
+	__u8		    type;  /* MODS_IRQ_TYPE_* */
+};
+
+struct mods_irq_2 {
+	__u32			delay; /* delay in ns between the irq occuring
+					  and MODS querying for it */
+	struct mods_pci_dev_2 dev;  /* device which generated the interrupt */
+};
+
+struct mods_irq {
+	__u32		    delay; /* delay in ns between the irq
+				      occuring and MODS querying
+				      for it */
+	struct mods_pci_dev dev;   /* device which generated
+				      the interrupt */
+};
+
+#define MODS_MAX_IRQS 32
+
+/* MODS_ESC_QUERY_IRQ_2 */
+struct MODS_QUERY_IRQ_2 {
+	/* OUT */
+	struct mods_irq_2 irq_list[MODS_MAX_IRQS];
+	__u8		    more;	/* indicates that more interrupts
+					   are waiting */
+};
+
+/* MODS_ESC_QUERY_IRQ */
+struct MODS_QUERY_IRQ {
+	/* OUT */
+	struct mods_irq irq_list[MODS_MAX_IRQS];
+	__u8		more;  /* indicates that more interrupts are waiting */
+};
+
+#define MODS_IRQ_TYPE_INT  0
+#define MODS_IRQ_TYPE_MSI  1
+#define MODS_IRQ_TYPE_CPU  2
+
+/* MODS_ESC_SET_IRQ_MASK_2 */
+struct MODS_SET_IRQ_MASK_2 {
+	/* IN */
+	__u64			aperture_addr;/* physical address of aperture */
+	__u32			aperture_size;/* size of the mapped region */
+	__u32			reg_offset;   /* offset of the irq mask register
+						 within the aperture */
+	__u64			and_mask;     /* and mask for clearing bits in
+						 the irq mask register */
+	__u64			or_mask;      /* or mask for setting bits in
+						 the irq mask register */
+	struct mods_pci_dev_2 dev;	      /* device identifying interrupt
+						 for which the mask will be
+						 applied */
+	__u8			irq_type;     /* irq type */
+	__u8			mask_type;    /* mask type */
+};
+
+/* MODS_ESC_SET_IRQ_MASK */
+struct MODS_SET_IRQ_MASK {
+	/* IN */
+	__u64		    aperture_addr; /* physical address of aperture */
+	__u32		    aperture_size; /* size of the mapped region */
+	__u32		    reg_offset;	   /* offset of the irq mask register
+					      within the aperture */
+	__u32		    and_mask;	   /* and mask for clearing bits in
+					      the irq mask register */
+	__u32		    or_mask;	   /* or mask for setting bits in
+					      the irq mask register */
+	struct mods_pci_dev dev;	   /* device identifying interrupt for
+					      which the mask will be applied */
+	__u8		    irq_type;	   /* irq type */
+	__u8		    mask_type;	   /* mask type */
+};
+
+#define MODS_MASK_TYPE_IRQ_DISABLE 0
+
+#define ACPI_MODS_TYPE_INTEGER		1
+#define ACPI_MODS_TYPE_BUFFER		2
+#define ACPI_MAX_BUFFER_LENGTH		4096
+#define ACPI_MAX_METHOD_LENGTH		12
+#define ACPI_MAX_ARGUMENT_NUMBER	12
+
+union ACPI_ARGUMENT {
+	__u32	type;
+
+	struct {
+		__u32 type;
+		__u32 value;
+	} integer;
+
+	struct {
+		__u32	type;
+		__u32	length;
+		__u32	offset;
+	} buffer;
+};
+
+/* MODS_ESC_EVAL_ACPI_METHOD */
+struct MODS_EVAL_ACPI_METHOD {
+	/* IN */
+	char		    method_name[ACPI_MAX_METHOD_LENGTH];
+	__u32		    argument_count;
+	union ACPI_ARGUMENT argument[ACPI_MAX_ARGUMENT_NUMBER];
+	__u8		    in_buffer[ACPI_MAX_BUFFER_LENGTH];
+
+	/* IN OUT */
+	__u32		    out_data_size;
+
+	/* OUT */
+	__u8		    out_buffer[ACPI_MAX_BUFFER_LENGTH];
+	__u32		    out_status;
+};
+
+/* MODS_ESC_EVAL_DEV_ACPI_METHOD_2 */
+struct MODS_EVAL_DEV_ACPI_METHOD_2 {
+	/* IN OUT */
+	struct MODS_EVAL_ACPI_METHOD method;
+
+	/* IN */
+	struct mods_pci_dev_2 device;
+};
+
+/* MODS_ESC_EVAL_DEV_ACPI_METHOD */
+struct MODS_EVAL_DEV_ACPI_METHOD {
+	/* IN OUT */
+	struct MODS_EVAL_ACPI_METHOD method;
+
+	/* IN */
+	struct mods_pci_dev device;
+};
+
+/* MODS_ESC_ACPI_GET_DDC_2 */
+struct MODS_ACPI_GET_DDC_2 {
+	/* OUT */
+	__u32			out_data_size;
+	__u8			out_buffer[ACPI_MAX_BUFFER_LENGTH];
+
+	/* IN */
+	struct mods_pci_dev_2 device;
+};
+
+/* MODS_ESC_ACPI_GET_DDC */
+struct MODS_ACPI_GET_DDC {
+	/* OUT */
+	__u32		    out_data_size;
+	__u8		    out_buffer[ACPI_MAX_BUFFER_LENGTH];
+
+	/* IN */
+	struct mods_pci_dev device;
+};
+
+/* MODS_ESC_GET_VERSION */
+struct MODS_GET_VERSION {
+	/* OUT */
+	__u64 version;
+};
+
+/* MODS_ESC_SET_PARA */
+struct MODS_SET_PARA {
+	/* IN */
+	__u64 Highmem4g;
+	__u64 debug;
+};
+
+/* MODS_ESC_SET_MEMORY_TYPE */
+struct MODS_MEMORY_TYPE {
+	/* IN */
+	__u64 physical_address;
+	__u64 size;
+	__u32 type;
+};
+
+#define MAX_CLOCK_HANDLE_NAME 64
+
+/* MODS_ESC_GET_CLOCK_HANDLE */
+struct MODS_GET_CLOCK_HANDLE {
+	/* OUT */
+	__u32 clock_handle;
+
+	/* IN */
+	char  device_name[MAX_CLOCK_HANDLE_NAME];
+	char  controller_name[MAX_CLOCK_HANDLE_NAME];
+};
+
+/* MODS_ESC_SET_CLOCK_RATE, MODS_ESC_GET_CLOCK_RATE,
+ * MODS_ESC_GET_CLOCK_MAX_RATE, MODS_ESC_SET_CLOCK_MAX_RATE */
+struct MODS_CLOCK_RATE {
+	/* IN/OUT */
+	__u64 clock_rate_hz;
+
+	/* IN */
+	__u32 clock_handle;
+};
+
+/* MODS_ESC_SET_CLOCK_PARENT, MODS_ESC_GET_CLOCK_PARENT */
+struct MODS_CLOCK_PARENT {
+	/* IN */
+	__u32 clock_handle;
+
+	/* IN/OUT */
+	__u32 clock_parent_handle;
+};
+
+/* MODS_ESC_ENABLE_CLOCK, MODS_ESC_DISABLE_CLOCK, MODS_ESC_CLOCK_RESET_ASSERT,
+ * MODS_ESC_CLOCK_RESET_DEASSERT */
+struct MODS_CLOCK_HANDLE {
+	/* IN */
+	__u32 clock_handle;
+};
+
+/* MODS_ESC_IS_CLOCK_ENABLED */
+struct MODS_CLOCK_ENABLED {
+	/* IN */
+	__u32 clock_handle;
+
+	/* OUT */
+	__u32 enable_count;
+};
+
+#if defined(CONFIG_PPC64) || defined(PPC64LE)
+#define MAX_CPU_MASKS 64  /* 32 masks of 32bits = 2048 CPUs max */
 #else
-#   define MODS_SET_MEMORY_UC(addr, pages) set_memory_uc(addr, pages)
-#   if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,29)
-#       define MODS_SET_MEMORY_WC(addr, pages) MODS_SET_MEMORY_UC(addr, pages)
-#   else
-#       define MODS_SET_MEMORY_WC(addr, pages) set_memory_wc(addr, pages)
-#   endif
-#   define MODS_SET_MEMORY_WB(addr, pages) set_memory_wb(addr, pages)
+#define MAX_CPU_MASKS 32  /* 32 masks of 32bits = 1024 CPUs max */
 #endif
+/* MODS_ESC_DEVICE_NUMA_INFO_2 */
+struct MODS_DEVICE_NUMA_INFO_2 {
+	/* IN */
+	struct mods_pci_dev_2 pci_device;
 
-#define MODS_PGPROT_UC pgprot_noncached
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,29)
-#   define MODS_PGPROT_WC pgprot_noncached
-#else
-#   define MODS_PGPROT_WC pgprot_writecombine
-#endif
+	/* OUT */
+	__s32  node;
+	__u32  node_count;
+	__u32  node_cpu_mask[MAX_CPU_MASKS];
+	__u32  cpu_count;
+};
 
-/* VMA */
-#define MODS_VMA_PGOFF(vma)             ((vma)->vm_pgoff)
-#define MODS_VMA_SIZE(vma)              ((vma)->vm_end - (vma)->vm_start)
-#define MODS_VMA_OFFSET(vma)            (((NvU64)(vma)->vm_pgoff) << PAGE_SHIFT)
-#define MODS_VMA_PRIVATE(vma)           ((vma)->vm_private_data)
-#define MODS_VMA_FILE(vma)              ((vma)->vm_file)
+/* MODS_ESC_DEVICE_NUMA_INFO */
+struct MODS_DEVICE_NUMA_INFO {
+	/* IN */
+	struct mods_pci_dev pci_device;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,10)
-    #define MODS_REMAP_PAGE_RANGE(vma, virt, phys, size, flags) \
-        remap_pfn_range(vma, virt, phys, size, flags)
-#else
-    #define MODS_REMAP_PAGE_RANGE(vma, virt, phys, size, flags) \
-        remap_page_range(vma, virt, phys<<PAGE_SHIFT, size, flags)
-#endif
+	/* OUT */
+	__s32  node;
+	__u32  node_count;
+	__u32  node_cpu_mask[MAX_CPU_MASKS];
+	__u32  cpu_count;
+};
 
-/* PCI */
-#define MODS_PCI_BUS_NUMBER(dev)                     (dev)->bus->number
-#define MODS_PCI_SLOT_NUMBER(dev)                    PCI_SLOT(MODS_PCI_DEVFN(dev))
-#define MODS_PCI_FUNCTION_NUMBER(dev)                PCI_FUNC(MODS_PCI_DEVFN(dev))
-#define MODS_PCI_DEVFN(dev)                          (dev)->devfn
-#define MODS_PCI_VENDOR(dev)                         (dev)->vendor
+/* The ids match MODS ids */
+#define MODS_MEMORY_CACHED		5
+#define MODS_MEMORY_UNCACHED		1
+#define MODS_MEMORY_WRITECOMBINE	2
 
-#define MODS_PCI_DEV_PUT(dev)                        pci_dev_put(dev)
-#define MODS_PCI_FIND_CAPABILITY(dev,id)             pci_find_capability(dev,id)
-#define MODS_PCI_GET_DEVICE(vendor,device,from)      pci_get_device(vendor,device,from)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,10)
-#define MODS_PCI_GET_CLASS(class,from)               pci_get_class(class,from)
-#else
-#define MODS_PCI_GET_CLASS(class,from)               pci_find_class(class,from)
-#endif
-#define MODS_PCI_FIND_BUS(domain, bus)               pci_find_bus(domain, bus)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,11)
-#define MODS_PCI_BUS_ADD_DEVICES(bus)                pci_bus_add_devices(bus)
-#define MODS_PCI_SCAN_CHILD_BUS(bus)                 pci_scan_child_bus(bus)
-#endif
+struct MODS_TEGRA_DC_WINDOW {
+	__s32 index;
+	__u32 flags;
+	__u32 x;
+	__u32 y;
+	__u32 w;
+	__u32 h;
+	__u32 out_x;
+	__u32 out_y;
+	__u32 out_w;
+	__u32 out_h;
+	__u32 pixformat; /* NVDC pix format */
 
-#define MODS_PCI_GET_SLOT(bus,devfn)                                      \
-   ({                                                                    \
-        struct pci_dev *__dev = NULL;                                    \
-        while ((__dev = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, __dev)))  \
-        {                                                                \
-            if (MODS_PCI_BUS_NUMBER(__dev) == bus                         \
-                    && MODS_PCI_DEVFN(__dev) == devfn) break;             \
-        }                                                                \
-        __dev;                                                           \
-    })
+	__u32 bandwidth;
+};
+#define MODS_TEGRA_DC_WINDOW_FLAG_ENABLED   (1 << 0)
+#define MODS_TEGRA_DC_WINDOW_FLAG_TILED     (1 << 1)
+#define MODS_TEGRA_DC_WINDOW_FLAG_SCAN_COL  (1 << 2)
+#define MODS_TEGRA_DC_MAX_WINDOWS           (6)
 
-#define MODS_PCI_READ_CONFIG_BYTE(dev,where,val)     pci_read_config_byte(dev,where,val)
-#define MODS_PCI_READ_CONFIG_WORD(dev,where,val)     pci_read_config_word(dev,where,val)
-#define MODS_PCI_READ_CONFIG_DWORD(dev,where,val)    pci_read_config_dword(dev,where,val)
-#define MODS_PCI_WRITE_CONFIG_BYTE(dev,where,val)    pci_write_config_byte(dev,where,val)
-#define MODS_PCI_WRITE_CONFIG_WORD(dev,where,val)    pci_write_config_word(dev,where,val)
-#define MODS_PCI_WRITE_CONFIG_DWORD(dev,where,val)   pci_write_config_dword(dev,where,val)
+/* MODS_ESC_TEGRA_DC_CONFIG_POSSIBLE */
+struct MODS_TEGRA_DC_CONFIG_POSSIBLE {
+	/* IN/OUT */
+	struct MODS_TEGRA_DC_WINDOW windows[MODS_TEGRA_DC_MAX_WINDOWS];
 
-#define MODS_PCI_ENABLE_DEVICE(dev)                  pci_enable_device(dev)
-#define MODS_PCI_DISABLE_DEVICE(dev)                 pci_disable_device(dev)
-#define MODS_PCI_ENABLE_MSI(dev)                     pci_enable_msi(dev)
-#define MODS_PCI_DISABLE_MSI(dev)                    pci_disable_msi(dev)
+	/* IN */
+	__u8 head;
+	__u8 win_num;
 
-/* ACPI */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,33)
-#define MODS_ACPI_WALK_NAMESPACE(type,start_object,max_depth,user_function,context,return_value)\
-    acpi_walk_namespace(type,start_object,max_depth,user_function,NULL,context,return_value)
-#else
-#define MODS_ACPI_WALK_NAMESPACE acpi_walk_namespace
-#endif
+	/* OUT */
+	__u8  possible;
+};
 
-/* PIO */
-#define MODS_PIO_READ_BYTE(port)             inb(port)
-#define MODS_PIO_READ_WORD(port)             inw(port)
-#define MODS_PIO_READ_DWORD(port)            inl(port)
-#define MODS_PIO_WRITE_BYTE(data,port)       outb(data,port)
-#define MODS_PIO_WRITE_WORD(data,port)       outw(data,port)
-#define MODS_PIO_WRITE_DWORD(data,port)      outl(data,port)
 
-/* FILE */
-#define MODS_GET_FILE_PRIVATE(fp)         (fp)->private_data
-#define MODS_GET_FILE_PRIVATE_ID(fp)      ((mods_file_private_data *)(fp)->private_data)->mods_id
+#define MODS_TEGRA_DC_SETUP_SD_LUT_SIZE  9
+#define MODS_TEGRA_DC_SETUP_BLTF_SIZE   16
+/* MODS_ESC_TEGRA_DC_SETUP_SD */
+struct MODS_TEGRA_DC_SETUP_SD {
+	/* IN */
+	__u8 head;
+	__u8 enable;
 
-/* SPIN_LOCK */
-#define MODS_INIT_LOCK(lock)             spin_lock_init(&lock)
-#define MODS_LOCK_IRQ(lock,flags)        spin_lock_irqsave(&lock,flags)
-#define MODS_UNLOCK_IRQ(lock,flags)      spin_unlock_irqrestore(&lock,flags)
-#define MODS_LOCK(lock)                  spin_lock(&lock)
-#define MODS_UNLOCK(lock)                spin_unlock(&lock)
+	__u8 use_vid_luma;
+	__u8 csc_r;
+	__u8 csc_g;
+	__u8 csc_b;
+	__u8 aggressiveness;
+	__u8 bin_width_log2;
 
-/* ATOMIC    */
-#define MODS_ATOMIC_SET(data,val)        atomic_set(&(data),(val))
-#define MODS_ATOMIC_INC(data)            atomic_inc(&(data))
-#define MODS_ATOMIC_DEC_AND_TEST(data)   atomic_dec_and_test(&(data))
+	__u32 lut[MODS_TEGRA_DC_SETUP_SD_LUT_SIZE];
+	__u32 bltf[MODS_TEGRA_DC_SETUP_BLTF_SIZE];
 
-/* *************************************************************************** */
-/* ** MODULE WIDE FUNCTIONS                                                    */
-/* *************************************************************************** */
+	__u32 klimit;
+	__u32 soft_clipping_threshold;
+	__u32 smooth_k_inc;
+	__u8  k_init_bias;
 
-/* irq */
-void mods_init_irq(void);
-void mods_cleanup_irq(void);
-unsigned char mods_alloc_channel(void);
-void mods_free_channel(unsigned char);
-void mods_irq_dev_clr_pri(unsigned char);
-void mods_irq_dev_set_pri(unsigned char id, void *pri);
-int mods_irq_event_check(unsigned char);
 
-/* mem */
-void mods_init_mem(void);
-void mods_add_mem(void *, NvU32, const char *, NvU32);
-void mods_del_mem(void *, NvU32, const char *, NvU32);
-int mods_map_pages(void);
-void mods_check_mem(void);
-void mods_unmap_pages(void);
-void mods_unregister_all_alloc(struct file *fp);
-PSYS_MEM_MODS_INFO mods_find_alloc(struct file *, NvU64);
+	__u32 win_x;
+	__u32 win_y;
+	__u32 win_w;
+	__u32 win_h;
+};
 
-/* clock */
-#ifdef CONFIG_ARM
-void mods_init_clock_api(void);
-void mods_shutdown_clock_api(void);
-#endif
+/* MODS_ESC_DMABUF_GET_PHYSICAL_ADDRESS */
+struct MODS_DMABUF_GET_PHYSICAL_ADDRESS {
+	/* IN */
+	__s32 buf_fd;
+	__u32 padding;
+	__u64 offset;
 
-#endif  /* _MODS_H_  */
+	/* OUT */
+	__u64 physical_address;
+	__u64 segment_size;
+};
+
+#define MODS_ADSP_APP_NAME_SIZE 64
+#define MODS_ADSP_APP_MAX_PARAM 128
+struct MODS_ADSP_RUN_APP_INFO {
+	char app_name[MODS_ADSP_APP_NAME_SIZE];
+	char app_file_name[MODS_ADSP_APP_NAME_SIZE];
+	__u32 argc;
+	__u32 argv[MODS_ADSP_APP_MAX_PARAM];
+	__u32 timeout;
+};
+
+#pragma pack(pop)
+
+/* ************************************************************************* */
+/* ************************************************************************* */
+/* **									     */
+/* ** ESCAPE CALLS							     */
+/* **									     */
+/* ************************************************************************* */
+/* ************************************************************************* */
+#define MODS_IOC_MAGIC	  'x'
+#define MODS_ESC_ALLOC_PAGES			\
+		   _IOWR(MODS_IOC_MAGIC, 0, struct MODS_ALLOC_PAGES)
+#define MODS_ESC_FREE_PAGES			\
+		   _IOWR(MODS_IOC_MAGIC, 1, struct MODS_FREE_PAGES)
+#define MODS_ESC_GET_PHYSICAL_ADDRESS		\
+		   _IOWR(MODS_IOC_MAGIC, 2, struct MODS_GET_PHYSICAL_ADDRESS)
+#define MODS_ESC_VIRTUAL_TO_PHYSICAL		\
+		   _IOWR(MODS_IOC_MAGIC, 3, struct MODS_VIRTUAL_TO_PHYSICAL)
+#define MODS_ESC_PHYSICAL_TO_VIRTUAL		\
+		   _IOWR(MODS_IOC_MAGIC, 4, struct MODS_PHYSICAL_TO_VIRTUAL)
+#define MODS_ESC_FIND_PCI_DEVICE		\
+		   _IOWR(MODS_IOC_MAGIC, 5, struct MODS_FIND_PCI_DEVICE)
+#define MODS_ESC_FIND_PCI_CLASS_CODE		\
+		   _IOWR(MODS_IOC_MAGIC, 6, struct MODS_FIND_PCI_CLASS_CODE)
+#define MODS_ESC_PCI_READ			\
+		   _IOWR(MODS_IOC_MAGIC, 7, struct MODS_PCI_READ)
+#define MODS_ESC_PCI_WRITE			\
+		   _IOWR(MODS_IOC_MAGIC, 8, struct MODS_PCI_WRITE)
+#define MODS_ESC_PIO_READ			\
+		   _IOWR(MODS_IOC_MAGIC, 9, struct MODS_PIO_READ)
+#define MODS_ESC_PIO_WRITE			\
+		   _IOWR(MODS_IOC_MAGIC, 10, struct MODS_PIO_WRITE)
+#define MODS_ESC_IRQ_REGISTER			\
+		   _IOWR(MODS_IOC_MAGIC, 11, struct MODS_IRQ)
+#define MODS_ESC_IRQ_FREE			\
+		   _IOWR(MODS_IOC_MAGIC, 12, struct MODS_IRQ)
+#define MODS_ESC_IRQ_INQUIRY			\
+		   _IOWR(MODS_IOC_MAGIC, 13, struct MODS_IRQ)
+#define MODS_ESC_EVAL_ACPI_METHOD		\
+		   _IOWR(MODS_IOC_MAGIC, 16, struct MODS_EVAL_ACPI_METHOD)
+#define MODS_ESC_GET_API_VERSION		\
+		   _IOWR(MODS_IOC_MAGIC, 17, struct MODS_GET_VERSION)
+#define MODS_ESC_GET_KERNEL_VERSION		\
+		   _IOWR(MODS_IOC_MAGIC, 18, struct MODS_GET_VERSION)
+#define MODS_ESC_SET_DRIVER_PARA		\
+		   _IOWR(MODS_IOC_MAGIC, 19, struct MODS_SET_PARA)
+#define MODS_ESC_MSI_REGISTER			\
+		   _IOWR(MODS_IOC_MAGIC, 20, struct MODS_IRQ)
+#define MODS_ESC_REARM_MSI			\
+		   _IOWR(MODS_IOC_MAGIC, 21, struct MODS_IRQ)
+#define MODS_ESC_SET_MEMORY_TYPE		\
+		    _IOW(MODS_IOC_MAGIC, 22, struct MODS_MEMORY_TYPE)
+#define MODS_ESC_PCI_BUS_ADD_DEVICES		\
+		    _IOW(MODS_IOC_MAGIC, 23, struct MODS_PCI_BUS_ADD_DEVICES)
+#define MODS_ESC_REGISTER_IRQ			\
+		    _IOW(MODS_IOC_MAGIC, 24, struct MODS_REGISTER_IRQ)
+#define MODS_ESC_UNREGISTER_IRQ			\
+		    _IOW(MODS_IOC_MAGIC, 25, struct MODS_REGISTER_IRQ)
+#define MODS_ESC_QUERY_IRQ			\
+		    _IOR(MODS_IOC_MAGIC, 26, struct MODS_QUERY_IRQ)
+#define MODS_ESC_EVAL_DEV_ACPI_METHOD		\
+		   _IOWR(MODS_IOC_MAGIC, 27, struct MODS_EVAL_DEV_ACPI_METHOD)
+#define MODS_ESC_ACPI_GET_DDC			\
+		   _IOWR(MODS_IOC_MAGIC, 28, struct MODS_ACPI_GET_DDC)
+#define MODS_ESC_GET_CLOCK_HANDLE		\
+		   _IOWR(MODS_IOC_MAGIC, 29, struct MODS_GET_CLOCK_HANDLE)
+#define MODS_ESC_SET_CLOCK_RATE			\
+		    _IOW(MODS_IOC_MAGIC, 30, struct MODS_CLOCK_RATE)
+#define MODS_ESC_GET_CLOCK_RATE			\
+		   _IOWR(MODS_IOC_MAGIC, 31, struct MODS_CLOCK_RATE)
+#define MODS_ESC_SET_CLOCK_PARENT		\
+		    _IOW(MODS_IOC_MAGIC, 32, struct MODS_CLOCK_PARENT)
+#define MODS_ESC_GET_CLOCK_PARENT		\
+		   _IOWR(MODS_IOC_MAGIC, 33, struct MODS_CLOCK_PARENT)
+#define MODS_ESC_ENABLE_CLOCK			\
+		    _IOW(MODS_IOC_MAGIC, 34, struct MODS_CLOCK_HANDLE)
+#define MODS_ESC_DISABLE_CLOCK			\
+		    _IOW(MODS_IOC_MAGIC, 35, struct MODS_CLOCK_HANDLE)
+#define MODS_ESC_IS_CLOCK_ENABLED		\
+		   _IOWR(MODS_IOC_MAGIC, 36, struct MODS_CLOCK_ENABLED)
+#define MODS_ESC_CLOCK_RESET_ASSERT		\
+		    _IOW(MODS_IOC_MAGIC, 37, struct MODS_CLOCK_HANDLE)
+#define MODS_ESC_CLOCK_RESET_DEASSERT		\
+		    _IOW(MODS_IOC_MAGIC, 38, struct MODS_CLOCK_HANDLE)
+#define MODS_ESC_SET_IRQ_MASK			\
+		    _IOW(MODS_IOC_MAGIC, 39, struct MODS_SET_IRQ_MASK)
+#define MODS_ESC_MEMORY_BARRIER			\
+		     _IO(MODS_IOC_MAGIC, 40)
+#define MODS_ESC_IRQ_HANDLED			\
+		    _IOW(MODS_IOC_MAGIC, 41, struct MODS_REGISTER_IRQ)
+#define MODS_ESC_FLUSH_CPU_CACHE_RANGE		\
+		    _IOW(MODS_IOC_MAGIC, 42, struct MODS_FLUSH_CPU_CACHE_RANGE)
+#define MODS_ESC_GET_CLOCK_MAX_RATE		\
+		   _IOWR(MODS_IOC_MAGIC, 43, struct MODS_CLOCK_RATE)
+#define MODS_ESC_SET_CLOCK_MAX_RATE		\
+		    _IOW(MODS_IOC_MAGIC, 44, struct MODS_CLOCK_RATE)
+#define MODS_ESC_DEVICE_ALLOC_PAGES		\
+		   _IOWR(MODS_IOC_MAGIC, 45, struct MODS_DEVICE_ALLOC_PAGES)
+#define MODS_ESC_DEVICE_NUMA_INFO		\
+		   _IOWR(MODS_IOC_MAGIC, 46, struct MODS_DEVICE_NUMA_INFO)
+#define MODS_ESC_TEGRA_DC_CONFIG_POSSIBLE	\
+		   _IOWR(MODS_IOC_MAGIC, 47,	\
+			 struct MODS_TEGRA_DC_CONFIG_POSSIBLE)
+#define MODS_ESC_TEGRA_DC_SETUP_SD		\
+		    _IOW(MODS_IOC_MAGIC, 48, struct MODS_TEGRA_DC_SETUP_SD)
+#define MODS_ESC_DMABUF_GET_PHYSICAL_ADDRESS	\
+		   _IOWR(MODS_IOC_MAGIC, 49,    \
+			 struct MODS_DMABUF_GET_PHYSICAL_ADDRESS)
+#define MODS_ESC_ADSP_LOAD			\
+		     _IO(MODS_IOC_MAGIC, 50)
+#define MODS_ESC_ADSP_START			\
+		     _IO(MODS_IOC_MAGIC, 51)
+#define MODS_ESC_ADSP_STOP			\
+		     _IO(MODS_IOC_MAGIC, 52)
+#define MODS_ESC_ADSP_RUN_APP			\
+		    _IOW(MODS_IOC_MAGIC, 53, struct MODS_ADSP_RUN_APP_INFO)
+#define MODS_ESC_PCI_GET_BAR_INFO		\
+		   _IOWR(MODS_IOC_MAGIC, 54, struct MODS_PCI_GET_BAR_INFO)
+#define MODS_ESC_PCI_GET_IRQ			\
+		   _IOWR(MODS_IOC_MAGIC, 55, struct MODS_PCI_GET_IRQ)
+#define MODS_ESC_GET_MAPPED_PHYSICAL_ADDRESS	\
+		   _IOWR(MODS_IOC_MAGIC, 56,	\
+			 struct MODS_GET_PHYSICAL_ADDRESS)
+#define MODS_ESC_DEVICE_ALLOC_PAGES_2		\
+		   _IOWR(MODS_IOC_MAGIC, 57, struct MODS_DEVICE_ALLOC_PAGES_2)
+#define MODS_ESC_FIND_PCI_DEVICE_2		\
+		   _IOWR(MODS_IOC_MAGIC, 58, struct MODS_FIND_PCI_DEVICE_2)
+#define MODS_ESC_FIND_PCI_CLASS_CODE_2		\
+		   _IOWR(MODS_IOC_MAGIC, 59,	\
+			 struct MODS_FIND_PCI_CLASS_CODE_2)
+#define MODS_ESC_PCI_GET_BAR_INFO_2		\
+		   _IOWR(MODS_IOC_MAGIC, 60, struct MODS_PCI_GET_BAR_INFO_2)
+#define MODS_ESC_PCI_GET_IRQ_2			\
+		   _IOWR(MODS_IOC_MAGIC, 61, struct MODS_PCI_GET_IRQ_2)
+#define MODS_ESC_PCI_READ_2			\
+		   _IOWR(MODS_IOC_MAGIC, 62, struct MODS_PCI_READ_2)
+#define MODS_ESC_PCI_WRITE_2			\
+		    _IOW(MODS_IOC_MAGIC, 63, struct MODS_PCI_WRITE_2)
+#define MODS_ESC_REGISTER_IRQ_2			\
+		    _IOW(MODS_IOC_MAGIC, 64, struct MODS_REGISTER_IRQ_2)
+#define MODS_ESC_UNREGISTER_IRQ_2		\
+		    _IOW(MODS_IOC_MAGIC, 65, struct MODS_REGISTER_IRQ_2)
+#define MODS_ESC_IRQ_HANDLED_2			\
+		    _IOW(MODS_IOC_MAGIC, 66, struct MODS_REGISTER_IRQ_2)
+#define MODS_ESC_QUERY_IRQ_2			\
+		    _IOR(MODS_IOC_MAGIC, 67, struct MODS_QUERY_IRQ_2)
+#define MODS_ESC_SET_IRQ_MASK_2			\
+		    _IOW(MODS_IOC_MAGIC, 68, struct MODS_SET_IRQ_MASK_2)
+#define MODS_ESC_EVAL_DEV_ACPI_METHOD_2		\
+		   _IOWR(MODS_IOC_MAGIC, 69,	\
+			 struct MODS_EVAL_DEV_ACPI_METHOD_2)
+#define MODS_ESC_DEVICE_NUMA_INFO_2		\
+		   _IOWR(MODS_IOC_MAGIC, 70, struct MODS_DEVICE_NUMA_INFO_2)
+#define MODS_ESC_ACPI_GET_DDC_2			\
+		   _IOWR(MODS_IOC_MAGIC, 71, struct MODS_ACPI_GET_DDC_2)
+
+#endif /* _MODS_H_  */
