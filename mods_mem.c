@@ -20,6 +20,7 @@
 #include "mods_internal.h"
 
 #include <linux/pagemap.h>
+#include <asm/set_memory.h>
 
 #ifdef CONFIG_BIGPHYS_AREA
 #include <linux/bigphysarea.h>

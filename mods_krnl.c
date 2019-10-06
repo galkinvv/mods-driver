@@ -68,7 +68,7 @@ struct pci_error_handlers mods_pci_error_handlers = {
 	.resume		= mods_pci_resume,
 };
 
-DEFINE_PCI_DEVICE_TABLE(mods_pci_table) = {
+static const struct pci_device_id mods_pci_table[] = {
 	{
 		.vendor		= PCI_VENDOR_ID_NVIDIA,
 		.device		= PCI_ANY_ID,
