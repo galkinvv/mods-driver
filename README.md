@@ -27,7 +27,9 @@ Use your distribution package meneger to install:
 Run `./install_module.sh` without parameters.
 On success it will build the module if it is not already build and load it into kernel.
 Running without parameters the script will not install module in system location and will not modify udev rules files.
-*Running with any parameters is not tested and can modify your system! See source code*
+
+**Running with any parameters is not tested and can modify your system! See source code**
+
 Here is example of expected output with examples of a typical output for correct operation:
 ```
 [root@pool mods-driver]# ./install_module.sh
