@@ -97,6 +97,9 @@ fi
 # Unload NVIDIA module
 if isloaded nvidia; then
     checkuser
+    $MODPROBE -r nvidia_uvm 2>/dev/null
+    $MODPROBE -r nvidia_drm 2>/dev/null
+    $MODPROBE -r nvidia_modeset 2>/dev/null
     $MODPROBE -r nvidia || die "Unable to unload nvidia module"
 fi
 
