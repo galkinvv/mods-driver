@@ -17,6 +17,10 @@
 # * along with NVIDIA MODS kernel driver.  If not, see
 # * <http://www.gnu.org/licenses/>.
 
+SELF=`dirname "$0"`
+SELF_DIR=`readlink -f "$SELF"`
+cd "$SELF_DIR"
+
 MODULE_NAME="mods"
 KERN_VERSION=`uname -r`
 MODULE_DIR="build-${KERN_VERSION}/"
