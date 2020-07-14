@@ -398,7 +398,7 @@ static int add_irq_map(unsigned char channel,
 #ifdef CONFIG_PCI
 	/* Map BAR0 of a graphics card to be able to disable interrupts */
 	if ((p->irq_type == MODS_IRQ_TYPE_INT) && is_nvidia_device(pdev)) {
-		char *bar = ioremap_nocache(p->aperture_addr, p->aperture_size);
+		char *bar = ioremap(p->aperture_addr, p->aperture_size);
 
 		if (!bar) {
 			mods_debug_printk(DEBUG_ISR,
@@ -1133,7 +1133,7 @@ int esc_mods_set_irq_multimask(struct file *pfile,
 				t->mask_info[0].dev_irq_state = 0;
 				mods_warning_printk("resetting IRQ mask\n");
 			}
-			bar = ioremap_nocache(p->aperture_addr,
+			bar = ioremap(p->aperture_addr,
 					      p->aperture_size);
 			if (!bar) {
 				mods_error_printk(
