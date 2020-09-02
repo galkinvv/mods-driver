@@ -24,7 +24,7 @@
 
 /* Driver version */
 #define MODS_DRIVER_VERSION_MAJOR 3
-#define MODS_DRIVER_VERSION_MINOR 66
+#define MODS_DRIVER_VERSION_MINOR 67
 #define MODS_DRIVER_VERSION ((MODS_DRIVER_VERSION_MAJOR << 8) | \
 			     ((MODS_DRIVER_VERSION_MINOR/10) << 4) | \
 			     (MODS_DRIVER_VERSION_MINOR%10))
@@ -506,6 +506,23 @@ struct MODS_SET_IRQ_MASK {
 	__u8		    mask_type;	   /* mask type */
 };
 
+#define MAX_DT_SIZE 64
+#define MAX_FULL_SIZE 128
+
+/*MODS_ESC_MAP_INTERRUPT*/
+struct MODS_DT_INFO {
+	/* OUT */
+	/* Logical irq number*/
+	__u32	irq;
+	/* IN */
+	/* DT name for looking up device tree node */
+	char	dt_name[MAX_DT_SIZE];
+	/* Full name of node as in device tree */
+	char	full_name[MAX_FULL_SIZE];
+	/* Irq index corresponding to physical irq */
+	__u32	index;
+};
+
 #define MODS_MASK_TYPE_IRQ_DISABLE      0
 #define MODS_MASK_TYPE_IRQ_DISABLE64    1
 
@@ -795,7 +812,7 @@ enum MODS_DMA_TRANSFER_DIRECTION {
 	MODS_DMA_MEM_TO_DEV,
 	MODS_DMA_DEV_TO_MEM,
 	MODS_DMA_DEV_TO_DEV,
-	MODS_DMA_TRANS_NONE,
+	MODS_DMA_TRANS_NONE
 };
 
 enum MODS_DMA_BUSWIDTH {
@@ -803,7 +820,7 @@ enum MODS_DMA_BUSWIDTH {
 	MODS_DMA_BUSWIDTH_1_BYTE = 1,
 	MODS_DMA_BUSWIDTH_2_BYTES = 2,
 	MODS_DMA_BUSWIDTH_4_BYTES = 4,
-	MODS_DMA_BUSWIDTH_8_BYTES = 8,
+	MODS_DMA_BUSWIDTH_8_BYTES = 8
 };
 
 struct MODS_DMA_CHANNEL_CONFIG {
@@ -823,7 +840,7 @@ struct MODS_DMA_CHANNEL_CONFIG {
 enum MODS_DMA_TX_MODE {
 	MODS_DMA_SINGLE = 0,
 	MODS_DMA_CYCLIC,
-	MODS_DMA_INTERLEAVED, /* Common to Slave as well as M2M clients. */
+	MODS_DMA_INTERLEAVED /* Common to Slave as well as M2M clients. */
 };
 
 typedef __s32 mods_dma_cookie_t;
@@ -842,8 +859,8 @@ struct MODS_DMA_TX_DESC	{
 };
 
 enum MODS_DMA_WAIT_TYPE {
-	MODS_DMA_SYNC_WAIT,	/* wait until finished */
-	MODS_DMA_ASYNC_WAIT, /* just check tx status */
+	MODS_DMA_SYNC_WAIT,     /* wait until finished */
+	MODS_DMA_ASYNC_WAIT     /* just check tx status */
 };
 
 struct MODS_DMA_WAIT_DESC {
@@ -912,7 +929,7 @@ struct MODS_DMA_COPY_TO_USER {
 #define MODS_ESC_IRQ_INQUIRY			\
 		   _IOWR(MODS_IOC_MAGIC, 13, struct MODS_IRQ)
 #define MODS_ESC_EVAL_ACPI_METHOD		\
-		   _IOWR(MODS_IOC_MAGIC, 16, struct MODS_EVAL_ACPI_METHOD)
+		   _IOWR_BAD(MODS_IOC_MAGIC, 16, struct MODS_EVAL_ACPI_METHOD)
 #define MODS_ESC_GET_API_VERSION		\
 		   _IOWR(MODS_IOC_MAGIC, 17, struct MODS_GET_VERSION)
 #define MODS_ESC_GET_KERNEL_VERSION		\
@@ -934,7 +951,7 @@ struct MODS_DMA_COPY_TO_USER {
 #define MODS_ESC_QUERY_IRQ			\
 		    _IOR(MODS_IOC_MAGIC, 26, struct MODS_QUERY_IRQ)
 #define MODS_ESC_EVAL_DEV_ACPI_METHOD		\
-		   _IOWR(MODS_IOC_MAGIC, 27, struct MODS_EVAL_DEV_ACPI_METHOD)
+		_IOWR_BAD(MODS_IOC_MAGIC, 27, struct MODS_EVAL_DEV_ACPI_METHOD)
 #define MODS_ESC_ACPI_GET_DDC			\
 		   _IOWR(MODS_IOC_MAGIC, 28, struct MODS_ACPI_GET_DDC)
 #define MODS_ESC_GET_CLOCK_HANDLE		\
@@ -1022,8 +1039,8 @@ struct MODS_DMA_COPY_TO_USER {
 #define MODS_ESC_SET_IRQ_MASK_2			\
 		    _IOW(MODS_IOC_MAGIC, 68, struct MODS_SET_IRQ_MASK_2)
 #define MODS_ESC_EVAL_DEV_ACPI_METHOD_2		\
-		   _IOWR(MODS_IOC_MAGIC, 69,	\
-			 struct MODS_EVAL_DEV_ACPI_METHOD_2)
+		   _IOWR_BAD(MODS_IOC_MAGIC, 69,\
+		   struct MODS_EVAL_DEV_ACPI_METHOD_2)
 #define MODS_ESC_DEVICE_NUMA_INFO_2		\
 		   _IOWR(MODS_IOC_MAGIC, 70, struct MODS_DEVICE_NUMA_INFO_2)
 #define MODS_ESC_ACPI_GET_DDC_2			\
@@ -1072,4 +1089,7 @@ struct MODS_DMA_COPY_TO_USER {
 #define MODS_ESC_DMA_COPY_TO_USER			\
 		   _IOWR(MODS_IOC_MAGIC, 91,		\
 		   struct MODS_DMA_COPY_TO_USER)
+#define MODS_ESC_MAP_INTERRUPT			\
+		   _IOWR(MODS_IOC_MAGIC, 92,		\
+		   struct MODS_DT_INFO)
 #endif /* _MODS_H_  */

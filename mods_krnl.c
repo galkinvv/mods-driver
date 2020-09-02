@@ -225,12 +225,20 @@ module_exit(mods_exit_module);
 
 MODULE_LICENSE("GPL");
 
+#define STRING_VALUE(x) #x
+#define MAKE_MODULE_VERSION(x, y) STRING_VALUE(x) "." STRING_VALUE(y)
+MODULE_VERSION(MAKE_MODULE_VERSION(MODS_DRIVER_VERSION_MAJOR,
+				   MODS_DRIVER_VERSION_MINOR));
+
 module_param(debug, int, 0);
 MODULE_PARM_DESC(debug,
-		 "debug level (0=normal, 1=debug, 2=irq, 3=rich debug)");
+		 "debug print level, bit flags (0x2: ioctls, 0x4: pci cfg, "
+		 "0x8: acpi, 0x10: irqs, 0x20: memory, 0x40: functions, "
+		 "0x110: detailed irqs, 0x120: detailed memory)");
+
 module_param(multi_instance, int, 0);
 MODULE_PARM_DESC(multi_instance,
-		 "allows more than one client to connect simultaneously to "
+		 "allows more than one client to simultaneously open "
 		 "the driver");
 
 #if defined(MODS_HAS_SET_PPC_TCE_BYPASS)
@@ -260,7 +268,7 @@ static void mods_disable_all_devices(struct mods_file_private_data *priv)
 		kfree(old);
 	}
 #else
-	BUG_ON(priv->enabled_devices != 0);
+	WARN_ON(priv->enabled_devices != 0);
 #endif
 }
 
@@ -882,7 +890,7 @@ static long mods_krnl_ioctl(struct file  *fp,
 			    unsigned int  cmd,
 			    unsigned long i_arg)
 {
-	int ret;
+	int ret = 0;
 	void *arg_copy = 0;
 	void *arg = (void *) i_arg;
 	int arg_size;
@@ -1157,6 +1165,13 @@ static long mods_krnl_ioctl(struct file  *fp,
 		ret = -EINVAL;
 		break;
 
+	case MODS_ESC_MAP_INTERRUPT:
+#if defined(MODS_TEGRA) && defined(CONFIG_OF_IRQ) && defined(CONFIG_OF)
+		MODS_IOCTL(MODS_ESC_MAP_INTERRUPT,
+				esc_mods_map_irq, MODS_DT_INFO);
+#endif
+		break;
+
 	case MODS_ESC_REGISTER_IRQ:
 		MODS_IOCTL_NORETVAL(MODS_ESC_REGISTER_IRQ,
 				esc_mods_register_irq, MODS_REGISTER_IRQ);
@@ -1249,7 +1264,7 @@ static long mods_krnl_ioctl(struct file  *fp,
 			   esc_mods_acpi_get_ddc_2, MODS_ACPI_GET_DDC_2);
 		break;
 
-#elif defined(MODS_TEGRA)
+#else
 	case MODS_ESC_EVAL_ACPI_METHOD:
 		/* fallthrough */
 	case MODS_ESC_EVAL_DEV_ACPI_METHOD:
@@ -1259,7 +1274,7 @@ static long mods_krnl_ioctl(struct file  *fp,
 	case MODS_ESC_ACPI_GET_DDC:
 		/* fallthrough */
 	case MODS_ESC_ACPI_GET_DDC_2:
-		/* Silent failure on Tegra to avoid clogging kernel log */
+		/* Silent failure to avoid clogging kernel log */
 		ret = -EINVAL;
 		break;
 #endif

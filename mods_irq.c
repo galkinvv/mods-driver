@@ -23,6 +23,13 @@
 #include <linux/poll.h>
 #include <linux/interrupt.h>
 #include <linux/pci_regs.h>
+#if defined(MODS_TEGRA) && defined(CONFIG_OF_IRQ) && defined(CONFIG_OF)
+#include <linux/of.h>
+#include <linux/of_irq.h>
+#include <linux/io.h>
+#include <linux/platform_device.h>
+#include <linux/of_device.h>
+#endif
 
 #define PCI_VENDOR_ID_NVIDIA 0x10de
 #define INDEX_IRQSTAT(irq)	(irq / BITS_NUM)
@@ -34,6 +41,8 @@
 #define IS_64BIT_ADDRESS(control)	(!!(control & PCI_MSI_FLAGS_64BIT))
 #define MSI_DATA_REG(base, is64bit) \
 	((is64bit == 1) ? base + PCI_MSI_DATA_64 : base + PCI_MSI_DATA_32)
+#define TOP_TKE_TKEIE_WDT_MASK(i)	(1 << (16 + 4 * (i)))
+#define TOP_TKE_TKEIE(i)		(0x100 + 4 * (i))
 
 struct nv_device {
 	char		  name[20];
@@ -108,6 +117,7 @@ static inline int mods_check_interrupt(struct dev_irq_map *t)
 		if (!t->mask_info[ii].dev_irq_state ||
 		    !t->mask_info[ii].dev_irq_mask_reg)
 			continue;
+
 		/* GPU device */
 		if (t->mask_info[ii].mask_type == MODS_MASK_TYPE_IRQ_DISABLE64)
 			valid |= ((*(u64 *)t->mask_info[ii].dev_irq_state &&
@@ -396,8 +406,10 @@ static int add_irq_map(unsigned char channel,
 	list_add(&newmap->list, &pmp->irq_head[channel - 1]);
 
 #ifdef CONFIG_PCI
-	/* Map BAR0 of a graphics card to be able to disable interrupts */
-	if ((p->irq_type == MODS_IRQ_TYPE_INT) && is_nvidia_device(pdev)) {
+	/* Map BAR0 to be able to disable interrupts */
+	if ((p->irq_type == MODS_IRQ_TYPE_INT) &&
+	    (p->aperture_addr != 0) &&
+	    (p->aperture_size != 0)) {
 		char *bar = ioremap(p->aperture_addr, p->aperture_size);
 
 		if (!bar) {
@@ -1099,6 +1111,13 @@ int esc_mods_set_irq_multimask(struct file *pfile,
 			return -EINVAL;
 		}
 		update_state_reg = is_nvidia_device(dev);
+		if (!update_state_reg) {
+			mods_error_printk(
+			"esc_mods_set_irq_multimask is only supported for CPU interrupts "
+			"or GPU devices!\n");
+			LOG_EXT();
+			return -EINVAL;
+		}
 #else
 		mods_error_printk("PCI not available\n");
 		LOG_EXT();
@@ -1158,6 +1177,9 @@ int esc_mods_set_irq_multimask(struct file *pfile,
 					    (u32 *)(bar+0x100);
 					im->dev_irq_mask_reg =
 					    (u32 *)(bar+0x140);
+				} else {
+					im->dev_irq_state = 0;
+					im->dev_irq_mask_reg = 0;
 				}
 			}
 			ret = OK;
@@ -1272,3 +1294,53 @@ int esc_mods_irq_handled(struct file *pfile,
 
 	return esc_mods_irq_handled_2(pfile, &register_irq);
 }
+
+#if defined(MODS_TEGRA) && defined(CONFIG_OF_IRQ) && defined(CONFIG_OF)
+int esc_mods_map_irq(struct file *pfile,
+					 struct MODS_DT_INFO *p)
+{
+	int ret;
+	/* the physical irq */
+	int hwirq;
+	/* irq parameters */
+	struct of_phandle_args oirq;
+	/* Search for the node by device tree name */
+	struct device_node *np = of_find_node_by_name(NULL, p->dt_name);
+
+	/* Can be multiple nodes that share the same dt name, */
+	/* make sure you get the correct node matched by the device's full */
+	/* name in device tree (i.e. watchdog@30c0000 as opposed */
+	/* to watchdog) */
+	while (of_node_cmp(np->full_name, p->full_name) != 0)
+		np = of_find_node_by_name(np, p->dt_name);
+
+	p->irq = irq_of_parse_and_map(np, p->index);
+	ret = of_irq_parse_one(np, p->index, &oirq);
+	if (ret) {
+		mods_error_printk("Could not parse IRQ\n");
+		return -EINVAL;
+	}
+
+	hwirq = oirq.args[1];
+	/* Get the platform device handle */
+	struct platform_device *pdev = of_find_device_by_node(np);
+
+	if (of_node_cmp(p->dt_name, "watchdog") == 0) {
+		/* Enable and unmask interrupt for watchdog */
+		struct resource *res_src = platform_get_resource(pdev,
+		IORESOURCE_MEM, 0);
+		struct resource *res_tke = platform_get_resource(pdev,
+		IORESOURCE_MEM, 2);
+		void __iomem *wdt_tke = devm_ioremap(&pdev->dev,
+		res_tke->start, resource_size(res_tke));
+		int wdt_index = ((res_src->start >> 16) & 0xF) - 0xc;
+
+		writel(TOP_TKE_TKEIE_WDT_MASK(wdt_index), wdt_tke +
+		TOP_TKE_TKEIE(hwirq));
+	}
+
+	/* enable the interrupt */
+	return 0;
+
+}
+#endif

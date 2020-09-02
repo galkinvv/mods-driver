@@ -458,6 +458,9 @@ int esc_mods_pci_unmap_resource(struct file *,
 				struct MODS_PCI_UNMAP_RESOURCE  *);
 #endif
 /* irq */
+#if defined(MODS_TEGRA) && defined(CONFIG_OF_IRQ) && defined(CONFIG_OF)
+int esc_mods_map_irq(struct file *pfile, struct MODS_DT_INFO *p);
+#endif
 int esc_mods_register_irq(struct file *, struct MODS_REGISTER_IRQ *);
 int esc_mods_register_irq_2(struct file *,
 			    struct MODS_REGISTER_IRQ_2 *);
