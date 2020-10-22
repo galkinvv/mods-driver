@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * mods_pci.c - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2008-2015, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2008-2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -21,202 +22,122 @@
 
 #include <linux/io.h>
 #include <linux/fs.h>
-
-/************************
- * PCI HELPER FUNCTIONS *
- ************************/
-
-static int mods_free_pci_res_map(struct file *fp,
-				 struct MODS_PCI_RES_MAP_INFO *p_del_map)
-{
-#if defined(MODS_HAS_PCI_MAP_RESOURCE)
-	struct MODS_PCI_RES_MAP_INFO *p_res_map;
-
-	MODS_PRIVATE_DATA(private_data, fp);
-	struct list_head  *head;
-	struct list_head  *iter;
-
-	mods_debug_printk(DEBUG_PCICFG,
-			  "free pci resource map %p\n",
-			  p_del_map);
-
-	if (unlikely(mutex_lock_interruptible(&private_data->mtx)))
-		return -EINTR;
-
-	head = private_data->mods_pci_res_map_list;
-
-	list_for_each(iter, head) {
-		p_res_map =
-			list_entry(iter, struct MODS_PCI_RES_MAP_INFO, list);
-
-		if (p_del_map == p_res_map) {
-			list_del(iter);
-
-			mutex_unlock(&private_data->mtx);
-
-			pci_unmap_resource(p_res_map->dev,
-					   p_res_map->va,
-					   p_res_map->page_count * PAGE_SIZE,
-					   PCI_DMA_BIDIRECTIONAL);
-			mods_debug_printk(DEBUG_PCICFG,
-					  "unmapped pci resource at 0x%llx from %u:%u:%u.%u\n",
-					  p_res_map->va,
-					  pci_domain_nr(p_res_map->dev->bus),
-					  p_res_map->dev->bus->number,
-					  PCI_SLOT(p_res_map->dev->devfn),
-					  PCI_FUNC(p_res_map->dev->devfn));
-			kfree(p_res_map);
-			return OK;
-		}
-	}
-
-	mutex_unlock(&private_data->mtx);
-
-	mods_error_printk("failed to unregister pci resource mapping %p\n",
-			  p_del_map);
-	return -EINVAL;
-#else
-	return OK;
+#if defined(MODS_HAS_DMA_OPS)
+#include <linux/dma-mapping.h>
 #endif
-}
-
-int mods_unregister_all_pci_res_mappings(struct file *fp)
-{
-	MODS_PRIVATE_DATA(private_data, fp);
-	struct list_head *head = private_data->mods_pci_res_map_list;
-	struct list_head *iter;
-	struct list_head *tmp;
-
-	list_for_each_safe(iter, tmp, head) {
-		struct MODS_PCI_RES_MAP_INFO *p_pci_res_map_info;
-		int ret;
-
-		p_pci_res_map_info =
-			list_entry(iter, struct MODS_PCI_RES_MAP_INFO, list);
-		ret = mods_free_pci_res_map(fp, p_pci_res_map_info);
-		if (ret)
-			return ret;
-	}
-
-	return OK;
-}
 
 /************************
  * PCI ESCAPE FUNCTIONS *
  ************************/
 
-int esc_mods_find_pci_dev_2(struct file *pfile,
+static int mods_find_pci_dev(struct file                   *pfile,
+			     struct MODS_FIND_PCI_DEVICE_2 *p,
+			     int                            enum_non_zero_dom)
+{
+	struct pci_dev *dev   = NULL;
+	int             index = -1;
+
+	mods_debug_printk(DEBUG_PCI,
+			  "find pci dev %04x:%04x, index %d\n",
+			  (int) p->vendor_id,
+			  (int) p->device_id,
+			  (int) p->index);
+
+	do {
+		dev = pci_get_device(p->vendor_id, p->device_id, dev);
+		if (!dev)
+			return -EINVAL;
+
+		if (enum_non_zero_dom || !pci_domain_nr(dev->bus))
+			++index;
+	} while (index < (int)(p->index));
+
+	p->pci_device.domain   = pci_domain_nr(dev->bus);
+	p->pci_device.bus      = dev->bus->number;
+	p->pci_device.device   = PCI_SLOT(dev->devfn);
+	p->pci_device.function = PCI_FUNC(dev->devfn);
+
+	return OK;
+}
+
+int esc_mods_find_pci_dev_2(struct file                   *pfile,
 			    struct MODS_FIND_PCI_DEVICE_2 *p)
 {
-	struct pci_dev *dev;
-	int index = 0;
-
-	mods_debug_printk(DEBUG_PCICFG,
-			  "find pci dev %04x:%04x, index %d\n",
-			  (int) p->vendor_id,
-			  (int) p->device_id,
-			  (int) p->index);
-
-	dev = pci_get_device(p->vendor_id, p->device_id, NULL);
-
-	while (dev) {
-		if (index == p->index) {
-			p->pci_device.domain	= pci_domain_nr(dev->bus);
-			p->pci_device.bus	= dev->bus->number;
-			p->pci_device.device	= PCI_SLOT(dev->devfn);
-			p->pci_device.function	= PCI_FUNC(dev->devfn);
-			return OK;
-		}
-		dev = pci_get_device(p->vendor_id, p->device_id, dev);
-		index++;
-	}
-
-	return -EINVAL;
+	return mods_find_pci_dev(pfile, p, 1);
 }
 
-int esc_mods_find_pci_dev(struct file *pfile,
+int esc_mods_find_pci_dev(struct file                 *pfile,
 			  struct MODS_FIND_PCI_DEVICE *p)
 {
-	struct pci_dev *dev;
-	int index = 0;
+	struct MODS_FIND_PCI_DEVICE_2 p2;
+	int                           ret;
 
-	mods_debug_printk(DEBUG_PCICFG,
-			  "find pci dev %04x:%04x, index %d\n",
-			  (int) p->vendor_id,
-			  (int) p->device_id,
-			  (int) p->index);
+	p2.device_id = p->device_id;
+	p2.vendor_id = p->vendor_id;
+	p2.index     = p->index;
 
-	dev = pci_get_device(p->vendor_id, p->device_id, NULL);
+	ret = mods_find_pci_dev(pfile, &p2, 0);
 
-	while (dev) {
-		if (index == p->index && pci_domain_nr(dev->bus) == 0) {
-			p->bus_number		= dev->bus->number;
-			p->device_number	= PCI_SLOT(dev->devfn);
-			p->function_number	= PCI_FUNC(dev->devfn);
-			return OK;
-		}
-		/* Only return devices in the first domain, but don't assume
-		   that they're the first devices in the list */
-		if (pci_domain_nr(dev->bus) == 0)
-			index++;
-		dev = pci_get_device(p->vendor_id, p->device_id, dev);
+	if (!ret) {
+		p->bus_number      = p2.pci_device.bus;
+		p->device_number   = p2.pci_device.device;
+		p->function_number = p2.pci_device.function;
 	}
 
-	return -EINVAL;
+	return ret;
 }
 
-int esc_mods_find_pci_class_code_2(struct file *pfile,
+static int mods_find_pci_class_code(struct file                       *pfile,
+				    struct MODS_FIND_PCI_CLASS_CODE_2 *p,
+				    int enum_non_zero_dom)
+{
+	struct pci_dev *dev   = NULL;
+	int             index = -1;
+
+	mods_debug_printk(DEBUG_PCI, "find pci class code %04x, index %d\n",
+			  (int) p->class_code, (int) p->index);
+
+	do {
+		dev = pci_get_class(p->class_code, dev);
+		if (!dev)
+			return -EINVAL;
+
+		if (enum_non_zero_dom || !pci_domain_nr(dev->bus))
+			++index;
+	} while (index < (int)(p->index));
+
+	p->pci_device.domain   = pci_domain_nr(dev->bus);
+	p->pci_device.bus      = dev->bus->number;
+	p->pci_device.device   = PCI_SLOT(dev->devfn);
+	p->pci_device.function = PCI_FUNC(dev->devfn);
+
+	return OK;
+}
+
+int esc_mods_find_pci_class_code_2(struct file                       *pfile,
 				   struct MODS_FIND_PCI_CLASS_CODE_2 *p)
 {
-	struct pci_dev *dev;
-	int index = 0;
-
-	mods_debug_printk(DEBUG_PCICFG, "find pci class code %04x, index %d\n",
-			  (int) p->class_code, (int) p->index);
-
-	dev = pci_get_class(p->class_code, NULL);
-
-	while (dev) {
-		if (index == p->index) {
-			p->pci_device.domain	= pci_domain_nr(dev->bus);
-			p->pci_device.bus	= dev->bus->number;
-			p->pci_device.device	= PCI_SLOT(dev->devfn);
-			p->pci_device.function	= PCI_FUNC(dev->devfn);
-			return OK;
-		}
-		dev = pci_get_class(p->class_code, dev);
-		index++;
-	}
-
-	return -EINVAL;
+	return mods_find_pci_class_code(pfile, p, 1);
 }
 
-int esc_mods_find_pci_class_code(struct file *pfile,
+int esc_mods_find_pci_class_code(struct file                     *pfile,
 				 struct MODS_FIND_PCI_CLASS_CODE *p)
 {
-	struct pci_dev *dev;
-	int index = 0;
+	struct MODS_FIND_PCI_CLASS_CODE_2 p2;
+	int                               ret;
 
-	mods_debug_printk(DEBUG_PCICFG, "find pci class code %04x, index %d\n",
-			  (int) p->class_code, (int) p->index);
+	p2.class_code = p->class_code;
+	p2.index      = p->index;
 
-	dev = pci_get_class(p->class_code, NULL);
+	ret = mods_find_pci_class_code(pfile, &p2, 0);
 
-	while (dev) {
-		if (index == p->index && pci_domain_nr(dev->bus) == 0) {
-			p->bus_number		= dev->bus->number;
-			p->device_number	= PCI_SLOT(dev->devfn);
-			p->function_number	= PCI_FUNC(dev->devfn);
-			return OK;
-		}
-		/* Only return devices in the first domain, but don't assume
-		   that they're the first devices in the list */
-		if (pci_domain_nr(dev->bus) == 0)
-			index++;
-		dev = pci_get_class(p->class_code, dev);
+	if (!ret) {
+		p->bus_number      = p2.pci_device.bus;
+		p->device_number   = p2.pci_device.device;
+		p->function_number = p2.pci_device.function;
 	}
 
-	return -EINVAL;
+	return ret;
 }
 
 int esc_mods_pci_get_bar_info_2(struct file *pfile,
@@ -234,11 +155,32 @@ int esc_mods_pci_get_bar_info_2(struct file *pfile,
 	if (dev == NULL)
 		return -EINVAL;
 
-	mods_debug_printk(DEBUG_PCICFG,
-			  "pci get bar info %04x:%x:%02x:%x, bar index %d\n",
+	mods_debug_printk(DEBUG_PCI,
+			  "pci get bar info %04x:%02x:%02x:%x, bar index %d\n",
 			  (int) p->pci_device.domain,
 			  (int) p->pci_device.bus, (int) p->pci_device.device,
 			  (int) p->pci_device.function, (int) p->bar_index);
+
+#if defined(CONFIG_PPC64)
+	if (unlikely(mutex_lock_interruptible(mods_get_irq_mutex()))) {
+		LOG_EXT();
+		return -EINTR;
+	}
+
+	/* Enable device on the PCI bus */
+	if (mods_enable_device(pfile->private_data, dev) == 0) {
+		mods_error_printk(
+		    "unable to enable dev %04x:%02x:%02x.%x\n",
+		    (unsigned int)p->pci_device.domain,
+		    (unsigned int)p->pci_device.bus,
+		    (unsigned int)p->pci_device.device,
+		    (unsigned int)p->pci_device.function);
+		mutex_unlock(mods_get_irq_mutex());
+		return -EINVAL;
+	}
+
+	mutex_unlock(mods_get_irq_mutex());
+#endif
 
 	bar_resource_offset = 0;
 	for (i = 0; i < p->bar_index; i++) {
@@ -268,6 +210,7 @@ int esc_mods_pci_get_bar_info(struct file *pfile,
 {
 	int retval;
 	struct MODS_PCI_GET_BAR_INFO_2 get_bar_info = { {0} };
+
 	get_bar_info.pci_device.domain		= 0;
 	get_bar_info.pci_device.bus		= p->pci_device.bus;
 	get_bar_info.pci_device.device		= p->pci_device.device;
@@ -295,8 +238,8 @@ int esc_mods_pci_get_irq_2(struct file *pfile,
 	if (dev == NULL)
 		return -EINVAL;
 
-	mods_debug_printk(DEBUG_PCICFG,
-			  "pci get irq %04x:%x:%02x:%x\n",
+	mods_debug_printk(DEBUG_PCI,
+			  "pci get irq %04x:%02x:%02x:%x\n",
 			  (int) p->pci_device.domain,
 			  (int) p->pci_device.bus, (int) p->pci_device.device,
 			  (int) p->pci_device.function);
@@ -311,6 +254,7 @@ int esc_mods_pci_get_irq(struct file *pfile,
 {
 	int retval;
 	struct MODS_PCI_GET_IRQ_2 get_irq = { {0} };
+
 	get_irq.pci_device.domain	= 0;
 	get_irq.pci_device.bus		= p->pci_device.bus;
 	get_irq.pci_device.device	= p->pci_device.device;
@@ -335,8 +279,8 @@ int esc_mods_pci_read_2(struct file *pfile, struct MODS_PCI_READ_2 *p)
 	if (dev == NULL)
 		return -EINVAL;
 
-	mods_debug_printk(DEBUG_PCICFG,
-			  "pci read %04x:%x:%02x.%x, addr 0x%04x, size %d\n",
+	mods_debug_printk(DEBUG_PCI,
+			  "pci read %04x:%02x:%02x.%x, addr 0x%04x, size %d\n",
 			  (int) p->pci_device.domain,
 			  (int) p->pci_device.bus, (int) p->pci_device.device,
 			  (int) p->pci_device.function, (int) p->address,
@@ -344,11 +288,19 @@ int esc_mods_pci_read_2(struct file *pfile, struct MODS_PCI_READ_2 *p)
 
 	p->data = 0;
 	switch (p->data_size) {
-	case 1:
-		pci_read_config_byte(dev, p->address, (u8 *) &p->data);
+	case 1: {
+			u8 value;
+
+			pci_read_config_byte(dev, p->address, &value);
+			p->data = value;
+		}
 		break;
-	case 2:
-		pci_read_config_word(dev, p->address, (u16 *) &p->data);
+	case 2: {
+			u16 value;
+
+			pci_read_config_word(dev, p->address, &value);
+			p->data = value;
+		}
 		break;
 	case 4:
 		pci_read_config_dword(dev, p->address, (u32 *) &p->data);
@@ -363,6 +315,7 @@ int esc_mods_pci_read(struct file *pfile, struct MODS_PCI_READ *p)
 {
 	int retval;
 	struct MODS_PCI_READ_2 pci_read = { {0} };
+
 	pci_read.pci_device.domain	= 0;
 	pci_read.pci_device.bus		= p->bus_number;
 	pci_read.pci_device.device	= p->device_number;
@@ -383,25 +336,24 @@ int esc_mods_pci_write_2(struct file *pfile, struct MODS_PCI_WRITE_2 *p)
 	struct pci_dev *dev;
 	unsigned int devfn;
 
-	mods_debug_printk(DEBUG_PCICFG,
-			  "pci write %04x:%x:%02x.%x, addr 0x%04x, size %d, "
-			  "data 0x%x\n",
-			  (int) p->pci_device.domain,
-			  (int) p->pci_device.bus, (int) p->pci_device.device,
-			  (int) p->pci_device.function,
-			  (int) p->address, (int) p->data_size, (int) p->data);
+	mods_debug_printk(DEBUG_PCI,
+		"pci write %04x:%02x:%02x.%x, addr 0x%04x, size %d, data 0x%x\n",
+		(int) p->pci_device.domain,
+		(int) p->pci_device.bus, (int) p->pci_device.device,
+		(int) p->pci_device.function,
+		(int) p->address, (int) p->data_size, (int) p->data);
 
 	devfn = PCI_DEVFN(p->pci_device.device, p->pci_device.function);
 	dev = MODS_PCI_GET_SLOT(p->pci_device.domain, p->pci_device.bus, devfn);
 
 	if (dev == NULL) {
 		mods_error_printk(
-		  "pci write to %04x:%x:%02x.%x, addr 0x%04x, size %d failed\n",
-		    (unsigned)p->pci_device.domain,
-		    (unsigned)p->pci_device.bus,
-		    (unsigned)p->pci_device.device,
-		    (unsigned)p->pci_device.function,
-		    (unsigned)p->address,
+		  "pci write to %04x:%02x:%02x.%x, addr 0x%04x, size %d failed\n",
+		    (unsigned int)p->pci_device.domain,
+		    (unsigned int)p->pci_device.bus,
+		    (unsigned int)p->pci_device.device,
+		    (unsigned int)p->pci_device.function,
+		    (unsigned int)p->address,
 		    (int)p->data_size);
 		return -EINVAL;
 	}
@@ -426,6 +378,7 @@ int esc_mods_pci_write(struct file *pfile,
 		       struct MODS_PCI_WRITE *p)
 {
 	struct MODS_PCI_WRITE_2 pci_write = { {0} };
+
 	pci_write.pci_device.domain	= 0;
 	pci_write.pci_device.bus	= p->bus_number;
 	pci_write.pci_device.device	= p->device_number;
@@ -463,8 +416,8 @@ int esc_mods_pci_hot_reset(struct file *pfile,
 	unsigned int devfn;
 	int retval;
 
-	mods_debug_printk(DEBUG_PCICFG,
-			  "pci_hot_reset %04x:%x:%02x.%x\n",
+	mods_debug_printk(DEBUG_PCI,
+			  "pci_hot_reset %04x:%02x:%02x.%x\n",
 			  (int) p->pci_device.domain,
 			  (int) p->pci_device.bus,
 			  (int) p->pci_device.device,
@@ -475,33 +428,33 @@ int esc_mods_pci_hot_reset(struct file *pfile,
 
 	if (dev == NULL) {
 		mods_error_printk(
-		    "pci_hot_reset cannot find pci device %04x:%x:%02x.%x\n",
-		    (unsigned)p->pci_device.domain,
-		    (unsigned)p->pci_device.bus,
-		    (unsigned)p->pci_device.device,
-		    (unsigned)p->pci_device.function);
+		    "pci_hot_reset cannot find pci device %04x:%02x:%02x.%x\n",
+		    (unsigned int)p->pci_device.domain,
+		    (unsigned int)p->pci_device.bus,
+		    (unsigned int)p->pci_device.device,
+		    (unsigned int)p->pci_device.function);
 		return -EINVAL;
 	}
 
 	retval = pci_set_pcie_reset_state(dev, pcie_hot_reset);
 	if (retval) {
 		mods_error_printk(
-		    "pci_hot_reset failed on %04x:%x:%02x.%x\n",
-		    (unsigned)p->pci_device.domain,
-		    (unsigned)p->pci_device.bus,
-		    (unsigned)p->pci_device.device,
-		    (unsigned)p->pci_device.function);
+		    "pci_hot_reset failed on %04x:%02x:%02x.%x\n",
+		    (unsigned int)p->pci_device.domain,
+		    (unsigned int)p->pci_device.bus,
+		    (unsigned int)p->pci_device.device,
+		    (unsigned int)p->pci_device.function);
 		return retval;
 	}
 
 	retval = pci_set_pcie_reset_state(dev, pcie_deassert_reset);
 	if (retval) {
 		mods_error_printk(
-		    "pci_hot_reset deassert failed on %04x:%x:%02x.%x\n",
-		    (unsigned)p->pci_device.domain,
-		    (unsigned)p->pci_device.bus,
-		    (unsigned)p->pci_device.device,
-		    (unsigned)p->pci_device.function);
+		    "pci_hot_reset deassert failed on %04x:%02x:%02x.%x\n",
+		    (unsigned int)p->pci_device.domain,
+		    (unsigned int)p->pci_device.bus,
+		    (unsigned int)p->pci_device.device,
+		    (unsigned int)p->pci_device.function);
 		return retval;
 	}
 
@@ -567,7 +520,7 @@ int esc_mods_device_numa_info_2(struct file *fp,
 	LOG_ENT();
 
 	if (dev == NULL) {
-		mods_error_printk("PCI device %u:%u:%u.%u not found\n",
+		mods_error_printk("PCI device %04x:%02x:%02x.%x not found\n",
 				  p->pci_device.domain,
 				  p->pci_device.bus, p->pci_device.device,
 				  p->pci_device.function);
@@ -612,6 +565,7 @@ int esc_mods_device_numa_info(struct file *fp,
 {
 	int retval, i;
 	struct MODS_DEVICE_NUMA_INFO_2 numa_info = { {0} };
+
 	numa_info.pci_device.domain	= 0;
 	numa_info.pci_device.bus	= p->pci_device.bus;
 	numa_info.pci_device.device	= p->pci_device.device;
@@ -629,177 +583,81 @@ int esc_mods_device_numa_info(struct file *fp,
 	return OK;
 }
 
-int esc_mods_pci_map_resource(struct file *fp,
-			      struct MODS_PCI_MAP_RESOURCE  *p)
+int esc_mods_get_iommu_state(struct file                 *pfile,
+			     struct MODS_GET_IOMMU_STATE *state)
 {
-#if defined(MODS_HAS_PCI_MAP_RESOURCE)
-	MODS_PRIVATE_DATA(private_data, fp);
-	unsigned int devfn;
-	struct pci_dev *rem_dev;
-	struct pci_dev *loc_dev;
-	struct MODS_PCI_RES_MAP_INFO *p_res_map;
+	int err = esc_mods_get_iommu_state_2(pfile, state);
 
-	LOG_ENT();
+	if (!err)
+		state->state = (state->state == MODS_SWIOTLB_DISABLED) ? 1 : 0;
 
-	devfn = PCI_DEVFN(p->local_pci_device.device,
-			  p->local_pci_device.function);
-	loc_dev = MODS_PCI_GET_SLOT(p->local_pci_device.domain,
-				    p->local_pci_device.bus, devfn);
-	if (!loc_dev) {
-		mods_error_printk("Local PCI device %u:%u:%u.%u not found\n",
-				  p->local_pci_device.domain,
-				  p->local_pci_device.bus,
-				  p->local_pci_device.device,
-				  p->local_pci_device.function);
-		LOG_EXT();
-		return -EINVAL;
-	}
+	return err;
+}
 
-	devfn = PCI_DEVFN(p->remote_pci_device.device,
-			  p->remote_pci_device.function);
-	rem_dev = MODS_PCI_GET_SLOT(p->remote_pci_device.domain,
-				    p->remote_pci_device.bus, devfn);
-	if (!rem_dev) {
-		mods_error_printk("Remote PCI device %u:%u:%u.%u not found\n",
-				  p->remote_pci_device.domain,
-				  p->remote_pci_device.bus,
-				  p->remote_pci_device.device,
-				  p->remote_pci_device.function);
-		LOG_EXT();
-		return -EINVAL;
-	}
+int esc_mods_get_iommu_state_2(struct file                 *pfile,
+			       struct MODS_GET_IOMMU_STATE *state)
+{
+#if !defined(CONFIG_SWIOTLB)
+	state->state = MODS_SWIOTLB_DISABLED;
+#elif defined(MODS_HAS_DMA_OPS) && \
+	(defined(MODS_HAS_NONCOH_DMA_OPS) || defined(MODS_HAS_MAP_SG_ATTRS))
 
-	if ((p->resource_index >= DEVICE_COUNT_RESOURCE) ||
-	    !pci_resource_len(rem_dev, p->resource_index)) {
-		mods_error_printk(
-			"Resource %u on device %u:%u:%u.%u not found\n",
-			p->resource_index,
-			p->remote_pci_device.domain,
-			p->remote_pci_device.bus,
-			p->remote_pci_device.device,
-			p->remote_pci_device.function);
-		LOG_EXT();
-		return -EINVAL;
-	}
+	unsigned int    devfn = PCI_DEVFN(state->pci_device.device,
+					  state->pci_device.function);
+	struct pci_dev *dev   = MODS_PCI_GET_SLOT(state->pci_device.domain,
+						  state->pci_device.bus,
+						  devfn);
 
-	if ((p->va < pci_resource_start(rem_dev, p->resource_index)) ||
-	    (p->va > pci_resource_end(rem_dev, p->resource_index)) ||
-	    (p->va + p->page_count * PAGE_SIZE >
-			pci_resource_end(rem_dev, p->resource_index))) {
-		mods_error_printk(
-			"Invalid resource address 0x%llx on device %u:%u:%u.%u "
-			"not found\n",
-			(unsigned long long)p->va,
-			p->remote_pci_device.domain,
-			p->remote_pci_device.bus,
-			p->remote_pci_device.device,
-			p->remote_pci_device.function);
-		LOG_EXT();
-		return -EINVAL;
-	}
+	const struct dma_map_ops *ops = get_dma_ops(&dev->dev);
 
-	p_res_map = kmalloc(sizeof(struct MODS_PCI_RES_MAP_INFO), GFP_KERNEL);
-	if (unlikely(!p_res_map)) {
-		mods_error_printk("failed to allocate pci res map struct\n");
-		LOG_EXT();
-		return -ENOMEM;
-	}
-
-	p_res_map->dev = loc_dev;
-	p_res_map->page_count = p->page_count;
-	p_res_map->va = pci_map_resource(loc_dev,
-		&rem_dev->resource[resource_index],
-		p->va - pci_resource_start(rem_dev, p->resource_index),
-		p->page_count * PAGE_SIZE,
-		PCI_DMA_BIDIRECTIONAL);
-	p_res_map->va = p->va;
-	if (pci_dma_mapping_error(loc_dev, p_res_map->va)) {
-		kfree(p_res_map);
-		LOG_EXT();
-		return -ENOMEM;
-	}
-
-	if (unlikely(mutex_lock_interruptible(&private_data->mtx))) {
-		kfree(p_res_map);
-		LOG_EXT();
-		return -EINTR;
-	}
-	list_add(&p_res_map->list, private_data->mods_pci_res_map_list);
-	mutex_unlock(&private_data->mtx);
-
-	p->va = p_res_map->va;
-
-	mods_debug_printk(DEBUG_PCICFG,
-			  "mapped pci resource %u from %u:%u:%u.%u to %u:%u:%u.%u at 0x%llx\n",
-			  p->resource_index,
-			  p->remote_pci_device.domain,
-			  p->remote_pci_device.bus,
-			  p->remote_pci_device.device,
-			  p->remote_pci_device.function,
-			  p->local_pci_device.domain,
-			  p->local_pci_device.bus,
-			  p->local_pci_device.device,
-			  p->local_pci_device.function,
-			  p->va);
+#if defined(MODS_HAS_NONCOH_DMA_OPS)
+	state->state = (ops != &noncoherent_swiotlb_dma_ops &&
+			ops != &coherent_swiotlb_dma_ops)
+		       ? MODS_SWIOTLB_DISABLED : MODS_SWIOTLB_ACTIVE;
 #else
-	/*
-	 * We still return OK, in case the system is running an older kernel
-	 * with the IOMMU disabled. The va parameter will still contain the
-	 * input physical address, which is what the device should use in this
-	 * fallback case.
-	 */
+	state->state = ops->map_sg != swiotlb_map_sg_attrs
+		       ? MODS_SWIOTLB_DISABLED : MODS_SWIOTLB_ACTIVE;
+#endif
+#elif defined(CONFIG_PPC64) || defined(CONFIG_ARM64)
+	/* No way to detect, assume SW I/O TLB is disabled on ppc64/arm64 */
+	state->state = MODS_SWIOTLB_DISABLED;
+#else
+	/* No way to detect on old kernel */
+	state->state = MODS_SWIOTLB_INDETERMINATE;
 #endif
 	return OK;
 }
 
-int esc_mods_pci_unmap_resource(struct file *fp,
-				struct MODS_PCI_UNMAP_RESOURCE  *p)
+int esc_mods_pci_set_dma_mask(struct file              *file,
+			      struct MODS_PCI_DMA_MASK *dma_mask)
 {
-#if defined(MODS_HAS_PCI_MAP_RESOURCE)
-	MODS_PRIVATE_DATA(private_data, fp);
-	unsigned int devfn = PCI_DEVFN(p->pci_device.device,
-				       p->pci_device.function);
-	struct pci_dev *dev = MODS_PCI_GET_SLOT(p->pci_device.domain,
-						p->pci_device.bus, devfn);
-	struct list_head *head = private_data->mods_pci_res_map_list;
-	struct list_head *iter;
-	struct list_head *tmp;
+	int             err;
+	unsigned int    devfn = PCI_DEVFN(dma_mask->pci_device.device,
+					  dma_mask->pci_device.function);
+	struct pci_dev *dev   = MODS_PCI_GET_SLOT(dma_mask->pci_device.domain,
+						  dma_mask->pci_device.bus,
+						  devfn);
+	u64             mask;
 
-	LOG_ENT();
-
-	if (!dev) {
-		mods_error_printk("PCI device %u:%u:%u.%u not found\n",
-				  p->pci_device.domain,
-				  p->pci_device.bus,
-				  p->pci_device.device,
-				  p->pci_device.function);
-		LOG_EXT();
+	if (dma_mask->num_bits > 64)
 		return -EINVAL;
-	}
+	mask = dma_mask->num_bits == 64 ? ~0ULL : (1ULL<<dma_mask->num_bits)-1;
 
-	list_for_each_safe(iter, tmp, head) {
-		struct MODS_PCI_RES_MAP_INFO *p_pci_res_map_info;
-
-		p_pci_res_map_info =
-		    list_entry(iter, struct MODS_PCI_RES_MAP_INFO, list);
-
-		if ((p_pci_res_map_info->dev == dev) &&
-		    (p_pci_res_map_info->va == p->va)) {
-			int ret = mods_free_pci_res_map(fp, p_pci_res_map_info);
-			LOG_EXT();
-			return ret;
-		}
-	}
-
-	mods_error_printk(
-		"PCI mapping 0x%llx on device %u:%u:%u.%u not found\n",
-		p->va,
-		p->pci_device.domain,
-		p->pci_device.bus,
-		p->pci_device.device,
-		p->pci_device.function);
-	return -EINVAL;
-#else
-	return OK;
+	err = pci_set_dma_mask(dev, mask);
+	if (err) {
+		mods_error_printk("failed to set dma mask 0x%llx for dev %04x:%02x:%02x.%x\n",
+				  mask,
+				  (unsigned int)dma_mask->pci_device.domain,
+				  (unsigned int)dma_mask->pci_device.bus,
+				  (unsigned int)dma_mask->pci_device.device,
+				  (unsigned int)dma_mask->pci_device.function);
+#if defined(CONFIG_PPC64)
+		/* Ignore error if TCE bypass is on */
+		if (dev->dma_mask == ~0ULL)
+			err = OK;
 #endif
+	} else
+		err = pci_set_consistent_dma_mask(dev, mask);
+
+	return err;
 }

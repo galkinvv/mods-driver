@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * mods_acpi.c - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2008-2016, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2008-2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -73,6 +74,7 @@ static int mods_extract_acpi_object(
 )
 {
 	int ret = OK;
+
 	switch (obj->type) {
 
 	case ACPI_TYPE_BUFFER:
@@ -83,6 +85,7 @@ static int mods_extract_acpi_object(
 			ret = -EINVAL;
 		} else if (obj->buffer.length <= buf_end-*buf) {
 			u32 size = obj->buffer.length;
+
 			memcpy(*buf, obj->buffer.pointer, size);
 			*buf += size;
 		} else {
@@ -94,7 +97,7 @@ static int mods_extract_acpi_object(
 		break;
 
 	case ACPI_TYPE_INTEGER:
-		if (4 <= buf_end-*buf) {
+		if (buf_end - *buf >= 4) {
 			if (obj->integer.value > 0xFFFFFFFFU) {
 				mods_error_printk(
 			    "integer value from ACPI method %s out of range\n",
@@ -120,16 +123,19 @@ static int mods_extract_acpi_object(
 			ret = -EINVAL;
 		} else {
 			union acpi_object *elements = obj->package.elements;
-			u32 size = 0;
-			u32 i;
+			u32                size     = 0;
+			u32                i;
+
 			for (i = 0; i < obj->package.count; i++) {
 				u8 *old_buf = *buf;
+
 				ret = mods_extract_acpi_object(method,
 							       &elements[i],
 							       buf,
 							       buf_end);
 				if (ret == OK) {
 					u32 new_size = *buf - old_buf;
+
 					if (size == 0) {
 						size = new_size;
 					} else if (size != new_size) {
@@ -147,7 +153,7 @@ static int mods_extract_acpi_object(
 	default:
 		mods_error_printk(
 			"unsupported ACPI output type 0x%02x from method %s\n",
-			(unsigned)obj->type, method);
+			(unsigned int)obj->type, method);
 		ret = -EINVAL;
 		break;
 
@@ -173,12 +179,12 @@ static int mods_eval_acpi_method(struct file		      *pfile,
 		struct pci_dev *dev;
 
 		mods_debug_printk(DEBUG_ACPI,
-				  "ACPI %s for device %04x:%x:%02x.%x\n",
+				  "ACPI %s for device %04x:%02x:%02x.%x\n",
 				  p->method_name,
-				  (unsigned)pdevice->domain,
-				  (unsigned)pdevice->bus,
-				  (unsigned)pdevice->device,
-				  (unsigned)pdevice->function);
+				  (unsigned int)pdevice->domain,
+				  (unsigned int)pdevice->bus,
+				  (unsigned int)pdevice->device,
+				  (unsigned int)pdevice->function);
 
 		devfn = PCI_DEVFN(pdevice->device, pdevice->function);
 		dev = MODS_PCI_GET_SLOT(pdevice->domain, pdevice->bus, devfn);
@@ -246,6 +252,7 @@ static int mods_eval_acpi_method(struct file		      *pfile,
 		ret = -EINVAL;
 	} else {
 		u8 *buf = p->out_buffer;
+
 		ret = mods_extract_acpi_object(p->method_name,
 					       acpi_method,
 					       &buf,
@@ -273,11 +280,11 @@ static int mods_acpi_get_ddc(struct file *pfile,
 	acpi_handle lcd_dev_handle	= NULL;
 
 	mods_debug_printk(DEBUG_ACPI,
-			  "ACPI _DDC (EDID) for device %04x:%x:%02x.%x\n",
-			  (unsigned)pci_device->domain,
-			  (unsigned)pci_device->bus,
-			  (unsigned)pci_device->device,
-			  (unsigned)pci_device->function);
+			  "ACPI _DDC (EDID) for device %04x:%02x:%02x.%x\n",
+			  (unsigned int)pci_device->domain,
+			  (unsigned int)pci_device->bus,
+			  (unsigned int)pci_device->device,
+			  (unsigned int)pci_device->function);
 
 	{
 		unsigned int devfn = PCI_DEVFN(pci_device->device,
@@ -332,12 +339,12 @@ static int mods_acpi_get_ddc(struct file *pfile,
 
 			lcd_dev_handle = dev->handle;
 			mods_debug_printk(DEBUG_ACPI,
-			    "ACPI: Found LCD 0x%x on device %04x:%x:%02x.%x\n",
-			    (unsigned)device_id,
-			    (unsigned)p->device.domain,
-			    (unsigned)p->device.bus,
-			    (unsigned)p->device.device,
-			    (unsigned)p->device.function);
+			    "ACPI: Found LCD 0x%x on device %04x:%02x:%02x.%x\n",
+			    (unsigned int)device_id,
+			    (unsigned int)p->device.domain,
+			    (unsigned int)p->device.bus,
+			    (unsigned int)p->device.device,
+			    (unsigned int)p->device.function);
 			break;
 		}
 
@@ -345,11 +352,11 @@ static int mods_acpi_get_ddc(struct file *pfile,
 
 	if (lcd_dev_handle == NULL) {
 		mods_error_printk(
-			"ACPI: LCD not found for device %04x:%x:%02x.%x\n",
-			(unsigned)p->device.domain,
-			(unsigned)p->device.bus,
-			(unsigned)p->device.device,
-			(unsigned)p->device.function);
+			"ACPI: LCD not found for device %04x:%02x:%02x.%x\n",
+			(unsigned int)p->device.domain,
+			(unsigned int)p->device.bus,
+			(unsigned int)p->device.device,
+			(unsigned int)p->device.function);
 		return -EINVAL;
 	}
 
@@ -418,6 +425,7 @@ int esc_mods_eval_dev_acpi_method(struct file *pfile,
 				  struct MODS_EVAL_DEV_ACPI_METHOD *p)
 {
 	struct mods_pci_dev_2 device = {0};
+
 	device.domain		= 0;
 	device.bus		= p->device.bus;
 	device.device		= p->device.device;
@@ -433,8 +441,9 @@ int esc_mods_acpi_get_ddc_2(struct file *pfile,
 
 int esc_mods_acpi_get_ddc(struct file *pfile, struct MODS_ACPI_GET_DDC *p)
 {
-	struct MODS_ACPI_GET_DDC_2 *pp = (struct MODS_ACPI_GET_DDC_2 *) p;
-	struct mods_pci_dev_2 device = {0};
+	struct MODS_ACPI_GET_DDC_2 *pp     = (struct MODS_ACPI_GET_DDC_2 *) p;
+	struct mods_pci_dev_2       device = {0};
+
 	device.domain	= 0;
 	device.bus	= p->device.bus;
 	device.device	= p->device.device;

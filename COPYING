@@ -9,11 +9,8 @@ The NVIDIA MODS kernel driver package contains the following files:
   mods_irq.c
   mods_acpi.c
   mods_krnl.c
-  mods_clock.c
   mods_debugfs.c
-  mods_tegradc.c
-  mods_dmabuf.c
-  mods_adsp.c
+  mods_ppc64.c
   mods_internal.h
   mods_config.h
   mods.h
