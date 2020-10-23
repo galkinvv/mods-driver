@@ -76,7 +76,7 @@ struct miscdevice mods_dev = {
 
 #if defined(MODS_CAN_REGISTER_PCI_DEV)
 static pci_ers_result_t mods_pci_error_detected(struct pci_dev *,
-						enum pci_channel_state);
+						pci_channel_state_t);
 static pci_ers_result_t mods_pci_mmio_enabled(struct pci_dev *);
 static void mods_pci_resume(struct pci_dev *);
 
@@ -574,7 +574,7 @@ static const char *mods_get_prot_str_for_range(struct file *fp,
  ********************/
 #if defined(MODS_CAN_REGISTER_PCI_DEV)
 static pci_ers_result_t mods_pci_error_detected(struct pci_dev *dev,
-						enum pci_channel_state state)
+						pci_channel_state_t state)
 {
 	mods_debug_printk(DEBUG_PCI,
 			  "pci_error_detected %04x:%02x:%02x.%x\n",
