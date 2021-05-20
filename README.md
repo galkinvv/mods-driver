@@ -23,12 +23,11 @@ Use your distribution package meneger to install:
 * Toolchain and make program required for building C kernel modules (for ubuntu it is `build-essential` package).
 * Kernel headers of your kernel version (typically is is package named like `linux*headers*`).
 
-### Load module
+### Loading module alternatives
+
+#### Alternative 1: universal - for any tools - manual loading
 Run `./install_module.sh` without parameters.
 On success it will build the module if it is not already build and load it into kernel.
-Running without parameters the script will not install module in system location and will not modify udev rules files.
-
-**Running with any parameters is not tested and can modify your system! See source code**
 
 Here is example of expected output with examples of a typical output for correct operation:
 ```
@@ -66,4 +65,8 @@ Already loaded module mods
 
 ```
 
-### Now you can use the software that needs this kernel module (until reboot).
+Now you can use the software that needs this kernel module - mods or mats - until reboot.
+
+#### Alternative 2: mods-specific autoloading
+mods utility (unlike mats!) can automatically run this script during startup if the module is not loaded in the kernal yet.
+So just put `install_module.sh` and `_aa_driver_*-src` folder in the directory with mods binary
