@@ -2,7 +2,7 @@
 /*
  * mods_debugfs.c - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2014-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2014-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -20,8 +20,6 @@
 
 #include "mods_internal.h"
 
-#ifdef MODS_HAS_DEBUGFS
-
 #include <linux/module.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
@@ -31,7 +29,11 @@
 
 static struct dentry *mods_debugfs_dir;
 
-#if defined(MODS_TEGRA) && defined(MODS_HAS_KFUSE)
+#ifdef CONFIG_ARCH_TEGRA_19x_SOC
+#include "mods_ras.h"
+#endif
+
+#if defined(CONFIG_ARCH_TEGRA) && defined(CONFIG_TEGRA_KFUSE)
 #include <soc/tegra/kfuse.h>
 #endif
 
@@ -421,7 +423,7 @@ static const struct file_operations mods_dc_crc_latched_fops = {
 };
 #endif /* CONFIG_TEGRA_DC */
 
-#if defined(MODS_TEGRA) && defined(MODS_HAS_KFUSE)
+#if defined(CONFIG_ARCH_TEGRA) && defined(CONFIG_TEGRA_KFUSE)
 static int mods_kfuse_show(struct seq_file *s, void *unused)
 {
 	unsigned int buf[KFUSE_DATA_SZ / 4];
@@ -451,7 +453,7 @@ static const struct file_operations mods_kfuse_fops = {
 	.llseek		= seq_lseek,
 	.release	= single_release,
 };
-#endif /* MODS_TEGRA */
+#endif /* CONFIG_ARCH_TEGRA */
 
 static int mods_debug_get(void *data, u64 *val)
 {
@@ -476,20 +478,52 @@ static int mods_mi_set(void *data, u64 val)
 	mods_set_multi_instance((int)val);
 	return 0;
 }
+
+#ifdef CONFIG_ARCH_TEGRA_19x_SOC
+static int mods_set_err_sel(void *data, u64 val)
+{
+	set_err_sel(val);
+	return 0;
+}
+DEFINE_SIMPLE_ATTRIBUTE(mods_err_sel_fops, 0, mods_set_err_sel, "%llu\n");
+
+static int mods_set_err_ctrl(void *data, u64 val)
+{
+	set_err_ctrl(val);
+	return 0;
+}
+
+static int mods_get_err_ctrl(void *data, u64 *val)
+{
+	*val = get_err_ctrl();
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(mods_err_ctrl_fops, mods_get_err_ctrl,
+				mods_set_err_ctrl, "%llu\n");
+
+static int mods_enable_cpu_core_reporting(void *data, u64 val)
+{
+	enable_cpu_core_reporting(val);
+	return 0;
+}
+DEFINE_SIMPLE_ATTRIBUTE(mods_enable_cpu_fops, 0, mods_enable_cpu_core_reporting,
+								"%llu\n");
+#endif
+
 DEFINE_SIMPLE_ATTRIBUTE(mods_mi_fops, mods_mi_get, mods_mi_set, "%llu\n");
-#endif /* MODS_HAS_DEBUGFS */
 
 void mods_remove_debugfs(void)
 {
-#ifdef MODS_HAS_DEBUGFS
 	debugfs_remove_recursive(mods_debugfs_dir);
 	mods_debugfs_dir = NULL;
-#endif
 }
 
 int mods_create_debugfs(struct miscdevice *modsdev)
 {
-#ifdef MODS_HAS_DEBUGFS
+#ifdef CONFIG_ARCH_TEGRA_19x_SOC
+	struct dentry *ras_debugfs_entry;
+#endif
 	struct dentry *retval;
 	int err = 0;
 #ifdef CONFIG_TEGRA_DC
@@ -539,6 +573,36 @@ int mods_create_debugfs(struct miscdevice *modsdev)
 		goto remove_out;
 	}
 
+#ifdef CONFIG_ARCH_TEGRA_19x_SOC
+	if (of_find_node_by_name(NULL, "carmel_ras")) {
+		ras_debugfs_entry = debugfs_create_dir("ras", mods_debugfs_dir);
+		if (IS_ERR(ras_debugfs_entry)) {
+			err = -EIO;
+			goto remove_out;
+		}
+
+		retval = debugfs_create_file("err_sel", 0644,
+			ras_debugfs_entry, 0, &mods_err_sel_fops);
+		if (IS_ERR(retval)) {
+			err = -EIO;
+			goto remove_out;
+		}
+
+		retval = debugfs_create_file("err_ctrl", 0644,
+			ras_debugfs_entry, 0, &mods_err_ctrl_fops);
+		if (IS_ERR(retval)) {
+			err = -EIO;
+			goto remove_out;
+		}
+		retval = debugfs_create_file("ccplex_config", 0644,
+			ras_debugfs_entry, 0, &mods_enable_cpu_fops);
+		if (IS_ERR(retval)) {
+			err = -EIO;
+			goto remove_out;
+		}
+	}
+#endif
+
 	retval = debugfs_create_file("debug", 0644,
 		mods_debugfs_dir, 0, &mods_debug_fops);
 	if (IS_ERR(retval)) {
@@ -553,7 +617,7 @@ int mods_create_debugfs(struct miscdevice *modsdev)
 		goto remove_out;
 	}
 
-#if defined(MODS_TEGRA) && defined(MODS_HAS_KFUSE)
+#if defined(CONFIG_ARCH_TEGRA) && defined(CONFIG_TEGRA_KFUSE)
 	retval = debugfs_create_file("kfuse_data", 0444,
 		mods_debugfs_dir, 0, &mods_kfuse_fops);
 	if (IS_ERR(retval)) {
@@ -699,8 +763,4 @@ remove_out:
 	dev_err(modsdev->this_device, "could not create debugfs\n");
 	mods_remove_debugfs();
 	return err;
-#else
-	return 0;
-#endif
 }
-

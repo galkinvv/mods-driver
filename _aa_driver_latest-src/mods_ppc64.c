@@ -2,7 +2,7 @@
 /*
  * mods_ppc64.c - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -22,10 +22,28 @@
 
 #include <linux/fs.h>
 
-static struct NVL_TRAINED *mods_find_nvlink_sysmem_trained(struct file *fp,
-						    struct pci_dev *dev)
+#ifdef MODS_HAS_PNV_PCI_GET_NPU_DEV
+static struct pci_dev *get_npu_dev(struct pci_dev *dev, int index)
 {
-	struct mods_client *client = fp->private_data;
+	return pnv_pci_get_npu_dev(dev, index);
+}
+#else
+#define get_npu_dev(dev, index) (NULL)
+#endif
+
+int has_npu_dev(struct pci_dev *dev, int index)
+{
+	struct pci_dev *npu_dev = get_npu_dev(dev, index);
+
+	/* We should call pci_dev_put(npu_dev), but it's currently crashing */
+
+	return npu_dev != NULL;
+}
+
+static struct NVL_TRAINED *mods_find_nvlink_sysmem_trained(
+				struct mods_client *client,
+				struct pci_dev     *dev)
+{
 	struct list_head   *plist_head;
 	struct list_head   *plist_iter;
 	struct NVL_TRAINED *p_nvl_trained;
@@ -44,14 +62,13 @@ static struct NVL_TRAINED *mods_find_nvlink_sysmem_trained(struct file *fp,
 	return NULL;
 }
 
-static int mods_register_nvlink_sysmem_trained(struct file    *fp,
-					struct pci_dev *dev,
-					u8 trained)
+static int mods_register_nvlink_sysmem_trained(struct mods_client *client,
+					       struct pci_dev     *dev,
+					       u8                  trained)
 {
-	struct mods_client *client = fp->private_data;
 	struct NVL_TRAINED *p_nvl_trained;
 
-	p_nvl_trained = mods_find_nvlink_sysmem_trained(fp, dev);
+	p_nvl_trained = mods_find_nvlink_sysmem_trained(client, dev);
 	if (p_nvl_trained != NULL) {
 		p_nvl_trained->trained = trained;
 		return OK;
@@ -61,34 +78,34 @@ static int mods_register_nvlink_sysmem_trained(struct file    *fp,
 		return -EINTR;
 
 	p_nvl_trained = kzalloc(sizeof(struct NVL_TRAINED),
-				   GFP_KERNEL | __GFP_NORETRY);
+				GFP_KERNEL | __GFP_NORETRY);
 	if (unlikely(!p_nvl_trained)) {
-		mods_error_printk("failed to allocate NvLink trained struct\n");
+		cl_error("failed to allocate NvLink trained struct\n");
 		LOG_EXT();
 		return -ENOMEM;
 	}
+	atomic_inc(&client->num_allocs);
 
-	p_nvl_trained->dev = dev;
+	p_nvl_trained->dev     = pci_dev_get(dev);
 	p_nvl_trained->trained = trained;
 
 	list_add(&p_nvl_trained->list,
 		 &client->nvlink_sysmem_trained_list);
 
-	mods_debug_printk(DEBUG_MEM,
-			"Registered NvLink trained on dev %04x:%02x:%02x.%x\n",
-			pci_domain_nr(dev->bus),
-			dev->bus->number,
-			PCI_SLOT(dev->devfn),
-			PCI_FUNC(dev->devfn));
+	cl_debug(DEBUG_MEM,
+		 "registered NvLink trained on dev %04x:%02x:%02x.%x\n",
+		 pci_domain_nr(dev->bus),
+		 dev->bus->number,
+		 PCI_SLOT(dev->devfn),
+		 PCI_FUNC(dev->devfn));
 	mutex_unlock(&client->mtx);
 	return OK;
 }
 
-static int mods_unregister_nvlink_sysmem_trained(struct file *fp,
-						 struct pci_dev *dev)
+static int mods_unregister_nvlink_sysmem_trained(struct mods_client *client,
+						 struct pci_dev     *dev)
 {
 	struct NVL_TRAINED *p_nvl_trained;
-	struct mods_client *client = fp->private_data;
 	struct list_head   *head   = &client->nvlink_sysmem_trained_list;
 	struct list_head   *iter;
 
@@ -102,30 +119,31 @@ static int mods_unregister_nvlink_sysmem_trained(struct file *fp,
 			list_entry(iter, struct NVL_TRAINED, list);
 
 		if (p_nvl_trained->dev == dev) {
-			int ret = 0;
-
 			list_del(iter);
 
 			mutex_unlock(&client->mtx);
 
-			mods_debug_printk(DEBUG_MEM,
-			    "Unregistered NvLink trained on dev %04x:%02x:%02x.%x\n",
-			    pci_domain_nr(p_nvl_trained->dev->bus),
-			    p_nvl_trained->dev->bus->number,
-			    PCI_SLOT(p_nvl_trained->dev->devfn),
-			    PCI_FUNC(p_nvl_trained->dev->devfn));
+			cl_debug(DEBUG_MEM,
+				 "unregistered NvLink trained on dev %04x:%02x:%02x.%x\n",
+				 pci_domain_nr(p_nvl_trained->dev->bus),
+				 p_nvl_trained->dev->bus->number,
+				 PCI_SLOT(p_nvl_trained->dev->devfn),
+				 PCI_FUNC(p_nvl_trained->dev->devfn));
+
+			pci_dev_put(dev);
 
 			kfree(p_nvl_trained);
+			atomic_dec(&client->num_allocs);
 
 			LOG_EXT();
-			return ret;
+			return OK;
 		}
 	}
 
 	mutex_unlock(&client->mtx);
 
-	mods_error_printk(
-		"Failed to unregister NvLink trained on dev %04x:%02x:%02x.%x\n",
+	cl_error(
+		"failed to unregister NvLink trained on dev %04x:%02x:%02x.%x\n",
 		pci_domain_nr(dev->bus),
 		dev->bus->number,
 		PCI_SLOT(dev->devfn),
@@ -136,68 +154,70 @@ static int mods_unregister_nvlink_sysmem_trained(struct file *fp,
 
 }
 
-int mods_unregister_all_nvlink_sysmem_trained(struct file *fp)
+int mods_unregister_all_nvlink_sysmem_trained(struct mods_client *client)
 {
-	struct mods_client *client = fp->private_data;
-	struct list_head   *head   = &client->nvlink_sysmem_trained_list;
-	struct list_head   *iter;
-	struct list_head   *tmp;
+	struct list_head *head = &client->nvlink_sysmem_trained_list;
+	struct list_head *iter;
+	struct list_head *tmp;
 
 	list_for_each_safe(iter, tmp, head) {
 		struct NVL_TRAINED *p_nvl_trained;
-		int ret;
+		int err;
 
 		p_nvl_trained =
 			list_entry(iter, struct NVL_TRAINED, list);
-		ret = mods_unregister_nvlink_sysmem_trained(fp,
+		err = mods_unregister_nvlink_sysmem_trained(client,
 							p_nvl_trained->dev);
-		if (ret)
-			return ret;
+		if (err)
+			return err;
 	}
 
 	return OK;
 }
 
-int mods_is_nvlink_sysmem_trained(struct file *fp,
-			   struct pci_dev *dev)
+int mods_is_nvlink_sysmem_trained(struct mods_client *client,
+				  struct pci_dev     *dev)
 {
 	struct NVL_TRAINED    *p_nvl_trained;
 
-	p_nvl_trained = mods_find_nvlink_sysmem_trained(fp, dev);
+	p_nvl_trained = mods_find_nvlink_sysmem_trained(client, dev);
 	if (p_nvl_trained != NULL)
 		return p_nvl_trained->trained;
 
 	return false;
 }
 
-int esc_mods_set_nvlink_sysmem_trained(struct file *fp,
+int esc_mods_set_nvlink_sysmem_trained(struct mods_client *client,
 				struct MODS_SET_NVLINK_SYSMEM_TRAINED *p)
 {
-	struct pci_dev *p_pci_dev;
-	unsigned int devfn = PCI_DEVFN(p->pci_device.device,
-				       p->pci_device.function);
-	int retval;
+	struct pci_dev *dev;
+	int             err;
 
 	LOG_ENT();
 
-	p_pci_dev = MODS_PCI_GET_SLOT(p->pci_device.domain,
-				p->pci_device.bus,
-				devfn);
-	if (!p_pci_dev) {
-		mods_error_printk("pci device not found\n");
-		return -EINVAL;
+	err = mods_find_pci_dev(client, &p->pci_device, &dev);
+	if (unlikely(err)) {
+		if (err == -ENODEV)
+			cl_error("dev %04x:%02x:%02x.%x not found\n",
+				 p->pci_device.domain,
+				 p->pci_device.bus,
+				 p->pci_device.device,
+				 p->pci_device.function);
+		LOG_EXT();
+		return err;
 	}
 
-	retval = mods_register_nvlink_sysmem_trained(fp, p_pci_dev, p->trained);
+	err = mods_register_nvlink_sysmem_trained(client, dev, p->trained);
 
+	pci_dev_put(dev);
 	LOG_EXT();
-	return retval;
+	return err;
 }
 
-static struct PPC_TCE_BYPASS *mods_find_ppc_tce_bypass(struct file *fp,
-						       struct pci_dev *dev)
+static struct PPC_TCE_BYPASS *mods_find_ppc_tce_bypass(
+				struct mods_client *client,
+				struct pci_dev     *dev)
 {
-	struct mods_client    *client = fp->private_data;
 	struct list_head      *plist_head;
 	struct list_head      *plist_iter;
 	struct PPC_TCE_BYPASS *p_ppc_tce_bypass;
@@ -216,23 +236,22 @@ static struct PPC_TCE_BYPASS *mods_find_ppc_tce_bypass(struct file *fp,
 	return NULL;
 }
 
-static int mods_register_ppc_tce_bypass(struct file    *fp,
-				    struct pci_dev *dev,
-				    u64 original_mask)
+static int mods_register_ppc_tce_bypass(struct mods_client *client,
+					struct pci_dev     *dev,
+					u64                 original_mask)
 {
-	struct mods_client    *client = fp->private_data;
 	struct PPC_TCE_BYPASS *p_ppc_tce_bypass;
 
 	/* only register the first time in order to restore the true actual dma
 	 * mask
 	 */
-	if (mods_find_ppc_tce_bypass(fp, dev) != NULL) {
-		mods_debug_printk(DEBUG_MEM,
-		    "TCE bypass already registered on dev %04x:%02x:%02x.%x\n",
-		    pci_domain_nr(dev->bus),
-		    dev->bus->number,
-		    PCI_SLOT(dev->devfn),
-		    PCI_FUNC(dev->devfn));
+	if (mods_find_ppc_tce_bypass(client, dev) != NULL) {
+		cl_debug(DEBUG_MEM,
+			 "TCE bypass already registered on dev %04x:%02x:%02x.%x\n",
+			 pci_domain_nr(dev->bus),
+			 dev->bus->number,
+			 PCI_SLOT(dev->devfn),
+			 PCI_FUNC(dev->devfn));
 		return OK;
 	}
 
@@ -242,32 +261,33 @@ static int mods_register_ppc_tce_bypass(struct file    *fp,
 	p_ppc_tce_bypass = kzalloc(sizeof(struct PPC_TCE_BYPASS),
 				   GFP_KERNEL | __GFP_NORETRY);
 	if (unlikely(!p_ppc_tce_bypass)) {
-		mods_error_printk("failed to allocate TCE bypass struct\n");
+		cl_error("failed to allocate TCE bypass struct\n");
 		LOG_EXT();
 		return -ENOMEM;
 	}
+	atomic_inc(&client->num_allocs);
 
-	p_ppc_tce_bypass->dev = dev;
+	p_ppc_tce_bypass->dev      = pci_dev_get(dev);
 	p_ppc_tce_bypass->dma_mask = original_mask;
 
 	list_add(&p_ppc_tce_bypass->list,
 		 &client->ppc_tce_bypass_list);
 
-	mods_debug_printk(DEBUG_MEM,
-			"Registered TCE bypass on dev %04x:%02x:%02x.%x\n",
-			pci_domain_nr(dev->bus),
-			dev->bus->number,
-			PCI_SLOT(dev->devfn),
-			PCI_FUNC(dev->devfn));
+	cl_debug(DEBUG_MEM,
+		 "registered TCE bypass on dev %04x:%02x:%02x.%x\n",
+		 pci_domain_nr(dev->bus),
+		 dev->bus->number,
+		 PCI_SLOT(dev->devfn),
+		 PCI_FUNC(dev->devfn));
 	mutex_unlock(&client->mtx);
 	return OK;
 }
 
-static int mods_unregister_ppc_tce_bypass(struct file *fp, struct pci_dev *dev)
+static int mods_unregister_ppc_tce_bypass(struct mods_client *client,
+					  struct pci_dev     *dev)
 {
 	struct PPC_TCE_BYPASS *p_ppc_tce_bypass;
-	struct mods_client    *client = fp->private_data;
-	struct list_head      *head   = &client->ppc_tce_bypass_list;
+	struct list_head      *head = &client->ppc_tce_bypass_list;
 	struct list_head      *iter;
 
 	LOG_ENT();
@@ -280,90 +300,89 @@ static int mods_unregister_ppc_tce_bypass(struct file *fp, struct pci_dev *dev)
 			list_entry(iter, struct PPC_TCE_BYPASS, list);
 
 		if (p_ppc_tce_bypass->dev == dev) {
-			int ret = 0;
+			int err = -EINVAL;
 
 			list_del(iter);
 
 			mutex_unlock(&client->mtx);
 
-			ret = pci_set_dma_mask(p_ppc_tce_bypass->dev,
+			err = pci_set_dma_mask(p_ppc_tce_bypass->dev,
 					       p_ppc_tce_bypass->dma_mask);
 			dma_set_coherent_mask(&p_ppc_tce_bypass->dev->dev,
 					      dev->dma_mask);
-			mods_debug_printk(DEBUG_MEM,
-			    "Restored dma_mask on dev %04x:%02x:%02x.%x to %llx\n",
-			    pci_domain_nr(p_ppc_tce_bypass->dev->bus),
-			    p_ppc_tce_bypass->dev->bus->number,
-			    PCI_SLOT(p_ppc_tce_bypass->dev->devfn),
-			    PCI_FUNC(p_ppc_tce_bypass->dev->devfn),
-			    p_ppc_tce_bypass->dma_mask);
+			cl_debug(DEBUG_MEM,
+				 "restored dma_mask on dev %04x:%02x:%02x.%x to %llx\n",
+				 pci_domain_nr(p_ppc_tce_bypass->dev->bus),
+				 p_ppc_tce_bypass->dev->bus->number,
+				 PCI_SLOT(p_ppc_tce_bypass->dev->devfn),
+				 PCI_FUNC(p_ppc_tce_bypass->dev->devfn),
+				 p_ppc_tce_bypass->dma_mask);
+
+			pci_dev_put(dev);
 
 			kfree(p_ppc_tce_bypass);
+			atomic_dec(&client->num_allocs);
 
 			LOG_EXT();
-			return ret;
+			return err;
 		}
 	}
 
 	mutex_unlock(&client->mtx);
 
-	mods_error_printk(
-		"Failed to unregister TCE bypass on dev %04x:%02x:%02x.%x\n",
-		pci_domain_nr(dev->bus),
-		dev->bus->number,
-		PCI_SLOT(dev->devfn),
-		PCI_FUNC(dev->devfn));
+	cl_error("failed to unregister TCE bypass on dev %04x:%02x:%02x.%x\n",
+		 pci_domain_nr(dev->bus),
+		 dev->bus->number,
+		 PCI_SLOT(dev->devfn),
+		 PCI_FUNC(dev->devfn));
 	LOG_EXT();
 
 	return -EINVAL;
 
 }
 
-int mods_unregister_all_ppc_tce_bypass(struct file *fp)
+int mods_unregister_all_ppc_tce_bypass(struct mods_client *client)
 {
-	struct mods_client *client = fp->private_data;
-	struct list_head   *head   = &client->ppc_tce_bypass_list;
-	struct list_head   *iter;
-	struct list_head   *tmp;
+	int              err   = OK;
+	struct list_head *head = &client->ppc_tce_bypass_list;
+	struct list_head *iter;
+	struct list_head *tmp;
 
 	list_for_each_safe(iter, tmp, head) {
 		struct PPC_TCE_BYPASS *p_ppc_tce_bypass;
-		int ret;
 
 		p_ppc_tce_bypass =
 			list_entry(iter, struct PPC_TCE_BYPASS, list);
-		ret = mods_unregister_ppc_tce_bypass(fp, p_ppc_tce_bypass->dev);
-		if (ret)
-			return ret;
+		err = mods_unregister_ppc_tce_bypass(client,
+						     p_ppc_tce_bypass->dev);
+		if (err)
+			break;
 	}
 
-	return OK;
+	return err;
 }
 
-int esc_mods_set_ppc_tce_bypass(struct file *fp,
-			    struct MODS_SET_PPC_TCE_BYPASS *p)
+int esc_mods_set_ppc_tce_bypass(struct mods_client             *client,
+				struct MODS_SET_PPC_TCE_BYPASS *p)
 {
-	int ret = OK;
-	dma_addr_t dma_addr;
-	unsigned int devfn = PCI_DEVFN(p->pci_device.device,
-				       p->pci_device.function);
-	struct pci_dev *dev = MODS_PCI_GET_SLOT(p->pci_device.domain,
-						p->pci_device.bus,
-						devfn);
-	u64 original_dma_mask;
-	u32 bypass_mode = p->mode;
-	u32 cur_bypass_mode = MODS_PPC_TCE_BYPASS_OFF;
-	u64 dma_mask = DMA_BIT_MASK(64);
+	int             err = OK;
+	dma_addr_t      dma_addr;
+	struct pci_dev *dev;
+	u64             original_dma_mask;
+	u32             bypass_mode     = p->mode;
+	u32             cur_bypass_mode = MODS_PPC_TCE_BYPASS_OFF;
+	u64             dma_mask        = DMA_BIT_MASK(64);
 
 	LOG_ENT();
 
-	if (!dev) {
-		mods_error_printk(
-		 "PCI device not found %04x:%02x:%02x.%x\n",
-		 p->pci_device.domain,
-		 p->pci_device.bus,
-		 p->pci_device.device,
-		 p->pci_device.function);
+	err = mods_find_pci_dev(client, &p->pci_device, &dev);
+	if (unlikely(err)) {
+		if (err == -ENODEV)
+			cl_error("dev %04x:%02x:%02x.%x not found\n",
+				 p->pci_device.domain,
+				 p->pci_device.bus,
+				 p->pci_device.device,
+				 p->pci_device.function);
 		LOG_EXT();
 		return -EINVAL;
 	}
@@ -375,7 +394,6 @@ int esc_mods_set_ppc_tce_bypass(struct file *fp,
 
 	if (original_dma_mask == DMA_BIT_MASK(64))
 		cur_bypass_mode = MODS_PPC_TCE_BYPASS_ON;
-
 
 	/*
 	 * Linux on IBM POWER8 offers 2 different DMA set-ups, sometimes
@@ -420,29 +438,32 @@ int esc_mods_set_ppc_tce_bypass(struct file *fp,
 		if (bypass_mode == MODS_PPC_TCE_BYPASS_OFF)
 			dma_mask = p->device_dma_mask;
 
-		if (pci_set_dma_mask(dev, dma_mask) != 0) {
-			mods_error_printk(
-			  "pci_set_dma_mask failed on dev %04x:%02x:%02x.%x\n",
-			  p->pci_device.domain,
-			  p->pci_device.bus,
-			  p->pci_device.device,
-			  p->pci_device.function);
+		err = pci_set_dma_mask(dev, dma_mask);
+		if (unlikely(err)) {
+			cl_error(
+				"pci_set_dma_mask failed on dev %04x:%02x:%02x.%x\n",
+				p->pci_device.domain,
+				p->pci_device.bus,
+				p->pci_device.device,
+				p->pci_device.function);
+			pci_dev_put(dev);
 			LOG_EXT();
-			return -EINVAL;
+			return err;
 		}
 	}
 
 	dma_addr = pci_map_single(dev, NULL, 1, DMA_BIDIRECTIONAL);
-	if (pci_dma_mapping_error(dev, dma_addr)) {
+	err = pci_dma_mapping_error(dev, dma_addr);
+	if (unlikely(err)) {
 		pci_set_dma_mask(dev, original_dma_mask);
-		mods_error_printk(
-			"pci_map_single failed on dev %04x:%02x:%02x.%x\n",
-			p->pci_device.domain,
-			p->pci_device.bus,
-			p->pci_device.device,
-			p->pci_device.function);
+		cl_error("pci_map_single failed on dev %04x:%02x:%02x.%x\n",
+			 p->pci_device.domain,
+			 p->pci_device.bus,
+			 p->pci_device.device,
+			 p->pci_device.function);
+		pci_dev_put(dev);
 		LOG_EXT();
-		return -EINVAL;
+		return err;
 	}
 	pci_unmap_single(dev, dma_addr, 1, DMA_BIDIRECTIONAL);
 
@@ -477,12 +498,11 @@ int esc_mods_set_ppc_tce_bypass(struct file *fp,
 			 * Huge DDW not available - page 0 mapped to non-zero
 			 * address below the 32-bit line.
 			 */
-			mods_warning_printk(
-			    "Enabling PPC TCE bypass mode failed due to platform on device %04x:%02x:%02x.%x\n",
-			    p->pci_device.domain,
-			    p->pci_device.bus,
-			    p->pci_device.device,
-			    p->pci_device.function);
+			cl_warn("enabling PPC TCE bypass mode failed due to platform on dev %04x:%02x:%02x.%x\n",
+				p->pci_device.domain,
+				p->pci_device.bus,
+				p->pci_device.device,
+				p->pci_device.function);
 			failed = true;
 		} else if ((dma_addr & original_dma_mask) != 0) {
 			/*
@@ -499,12 +519,11 @@ int esc_mods_set_ppc_tce_bypass(struct file *fp,
 			if ((dma_addr & ~original_dma_mask) !=
 			    ((dma_addr + memory_size) & ~original_dma_mask)) {
 
-				mods_warning_printk(
-				    "Enabling PPC TCE bypass mode failed due to memory size on device %04x:%02x:%02x.%x\n",
-				    p->pci_device.domain,
-				    p->pci_device.bus,
-				    p->pci_device.device,
-				    p->pci_device.function);
+				cl_warn("enabling PPC TCE bypass mode failed due to memory size on dev %04x:%02x:%02x.%x\n",
+					p->pci_device.domain,
+					p->pci_device.bus,
+					p->pci_device.device,
+					p->pci_device.function);
 				failed = true;
 			}
 		}
@@ -512,77 +531,79 @@ int esc_mods_set_ppc_tce_bypass(struct file *fp,
 			pci_set_dma_mask(dev, original_dma_mask);
 	}
 
-	mods_debug_printk(DEBUG_MEM,
-	    "%s ppc tce bypass on device %04x:%02x:%02x.%x with dma mask 0x%llx\n",
-	    (dev->dma_mask == DMA_BIT_MASK(64)) ? "Enabled" : "Disabled",
-	    p->pci_device.domain,
-	    p->pci_device.bus,
-	    p->pci_device.device,
-	    p->pci_device.function,
-	    dev->dma_mask);
+	cl_debug(DEBUG_MEM,
+		 "%s ppc tce bypass on dev %04x:%02x:%02x.%x with dma mask 0x%llx\n",
+		 (dev->dma_mask == DMA_BIT_MASK(64)) ? "enabled" : "disabled",
+		 p->pci_device.domain,
+		 p->pci_device.bus,
+		 p->pci_device.device,
+		 p->pci_device.function,
+		 dev->dma_mask);
 
 	p->dma_base_address = dma_addr & ~(p->device_dma_mask);
 
-	mods_debug_printk(DEBUG_MEM,
-		"dma base address 0x%0llx on device %04x:%02x:%02x.%x\n",
-		p->dma_base_address,
-		p->pci_device.domain,
-		p->pci_device.bus,
-		p->pci_device.device,
-		p->pci_device.function);
+	cl_debug(DEBUG_MEM,
+		 "dma base address 0x%0llx on dev %04x:%02x:%02x.%x\n",
+		 p->dma_base_address,
+		 p->pci_device.domain,
+		 p->pci_device.bus,
+		 p->pci_device.device,
+		 p->pci_device.function);
 
 	/* Update the coherent mask to match */
 	dma_set_coherent_mask(&dev->dev, dev->dma_mask);
 
 	if (original_dma_mask != dev->dma_mask)
-		ret = mods_register_ppc_tce_bypass(fp, dev, original_dma_mask);
+		err = mods_register_ppc_tce_bypass(client,
+						   dev,
+						   original_dma_mask);
 
+	pci_dev_put(dev);
 	LOG_EXT();
-	return ret;
+	return err;
 }
 
-int esc_mods_get_ats_address_range(struct file *fp,
+int esc_mods_get_ats_address_range(struct mods_client                *client,
 				   struct MODS_GET_ATS_ADDRESS_RANGE *p)
 {
-	unsigned int	    devfn;
-	struct pci_dev	   *dev;
-	struct pci_dev	   *npu_dev = NULL;
+	struct pci_dev	   *dev      = NULL;
+	struct pci_dev	   *npu_dev  = NULL;
 	struct device_node *mem_node = NULL;
-	const __u32	   *val32;
+	const __u32	   *val32    = NULL;
 	const __u64	   *val64;
 	int		    len;
-	int		    ret = -EINVAL;
+	int		    err      = -EINVAL;
 
 	LOG_ENT();
 
-	mods_debug_printk(DEBUG_PCI,
-			  "get ats addr, dev %04x:%02x:%02x:%x, npu index %d\n",
-			  (int)p->pci_device.domain,
-			  (int)p->pci_device.bus,
-			  (int)p->pci_device.device,
-			  (int)p->pci_device.function,
-			  (int)p->npu_index);
+	cl_debug(DEBUG_PCI,
+		 "get ats addr, dev %04x:%02x:%02x:%x, npu index %d\n",
+		 p->pci_device.domain,
+		 p->pci_device.bus,
+		 p->pci_device.device,
+		 p->pci_device.function,
+		 p->npu_index);
 
-	devfn = PCI_DEVFN(p->pci_device.device, p->pci_device.function);
-	dev = MODS_PCI_GET_SLOT(p->pci_device.domain, p->pci_device.bus, devfn);
-	if (dev == NULL)  {
-		mods_error_printk("PCI device %04x:%02x:%02x.%x not found\n",
-				  p->pci_device.domain,
-				  p->pci_device.bus,
-				  p->pci_device.device,
-				  p->pci_device.function);
+	err = mods_find_pci_dev(client, &p->pci_device, &dev);
+	if (unlikely(err)) {
+		if (err == -ENODEV)
+			cl_error("dev %04x:%02x:%02x.%x not found\n",
+				 p->pci_device.domain,
+				 p->pci_device.bus,
+				 p->pci_device.device,
+				 p->pci_device.function);
 		goto exit;
 	}
 
-#if defined(MODS_HAS_PNV_PCI_GET_NPU_DEV)
-	npu_dev = pnv_pci_get_npu_dev(dev, p->npu_index);
-#endif
-	if (npu_dev == NULL) {
-		mods_error_printk("NPU device for %04x:%02x:%02x.%x not found\n",
-				  p->pci_device.domain,
-				  p->pci_device.bus,
-				  p->pci_device.device,
-				  p->pci_device.function);
+	err = -ENODEV;
+
+	npu_dev = get_npu_dev(dev, p->npu_index);
+	if (unlikely(npu_dev == NULL)) {
+		cl_error("NPU device for dev %04x:%02x:%02x.%x not found\n",
+			 p->pci_device.domain,
+			 p->pci_device.bus,
+			 p->pci_device.device,
+			 p->pci_device.function);
 		goto exit;
 	}
 
@@ -591,30 +612,31 @@ int esc_mods_get_ats_address_range(struct file *fp,
 	p->npu_device.device   = PCI_SLOT(npu_dev->devfn);
 	p->npu_device.function = PCI_FUNC(npu_dev->devfn);
 
-	mods_debug_printk(DEBUG_PCI,
-			  "Found NPU device %04x:%02x:%02x.%x\n",
-			  p->npu_device.domain,
-			  p->npu_device.bus,
-			  p->npu_device.device,
-			  p->npu_device.function);
+	cl_debug(DEBUG_PCI,
+		 "found NPU device %04x:%02x:%02x.%x\n",
+		 p->npu_device.domain,
+		 p->npu_device.bus,
+		 p->npu_device.device,
+		 p->npu_device.function);
 
-	val32 = (const __u32 *)of_get_property(npu_dev->dev.of_node,
-					       "memory-region",
-					       &len);
+	if (npu_dev->dev.of_node)
+		val32 = (const __u32 *)of_get_property(npu_dev->dev.of_node,
+						       "memory-region",
+						       &len);
 	if (!val32 || len < 4) {
-		mods_error_printk("Property memory-region for NPU not found\n");
+		cl_error("property memory-region for NPU not found\n");
 		goto exit;
 	}
 
 	mem_node = of_find_node_by_phandle(be32_to_cpu(*val32));
 	if (!mem_node) {
-		mods_error_printk("Node memory-region for NPU not found\n");
+		cl_error("node memory-region for NPU not found\n");
 		goto exit;
 	}
 
 	p->numa_memory_node = of_node_to_nid(mem_node);
 	if (p->numa_memory_node == NUMA_NO_NODE) {
-		mods_error_printk("NUMA node for NPU not found\n");
+		cl_error("NUMA node for NPU not found\n");
 		goto exit;
 	}
 
@@ -622,8 +644,7 @@ int esc_mods_get_ats_address_range(struct file *fp,
 					       "ibm,device-tgt-addr",
 					       &len);
 	if (!val64 || len < 8) {
-		mods_error_printk(
-			"Property ibm,device-tgt-addr for NPU not found\n");
+		cl_error("property ibm,device-tgt-addr for NPU not found\n");
 		goto exit;
 	}
 
@@ -631,91 +652,144 @@ int esc_mods_get_ats_address_range(struct file *fp,
 
 	val64 = (const __u64 *)of_get_property(mem_node, "reg", &len);
 	if (!val64 || len < 16) {
-		mods_error_printk("Property reg for memory region not found\n");
+		cl_error("property reg for memory region not found\n");
 		goto exit;
 	}
 
 	p->guest_addr    = be64_to_cpu(val64[0]);
 	p->aperture_size = be64_to_cpu(val64[1]);
 
-	ret = OK;
+	err = OK;
 
 exit:
-	if (mem_node)
-		of_node_put(mem_node);
+	of_node_put(mem_node);
+	/* We should call pci_dev_put(npu_dev), but it's currently crashing */
+	pci_dev_put(dev);
 	LOG_EXT();
-	return ret;
+	return err;
 }
 
-int esc_mods_get_nvlink_line_rate(struct file *fp,
+int esc_mods_get_nvlink_line_rate(struct mods_client               *client,
 				  struct MODS_GET_NVLINK_LINE_RATE *p)
 {
-	unsigned int   devfn;
-	struct pci_dev *dev;
+	struct pci_dev *dev     = NULL;
 	struct pci_dev *npu_dev = NULL;
-	const __u32    *val32;
-	int	       len;
-	int	       ret = -EINVAL;
+	const __u32    *val32   = NULL;
+	int             len;
+	int             err     = -EINVAL;
 
 	LOG_ENT();
 
-	mods_debug_printk(DEBUG_PCI,
-			  "get nvlink speed, dev %04x:%02x:%02x.%x, npu index %d\n",
-			  (int)p->pci_device.domain,
-			  (int)p->pci_device.bus,
-			  (int)p->pci_device.device,
-			  (int)p->pci_device.function,
-			  (int)p->npu_index);
+	cl_debug(DEBUG_PCI,
+		 "get nvlink speed, dev %04x:%02x:%02x.%x, npu index %d\n",
+		 p->pci_device.domain,
+		 p->pci_device.bus,
+		 p->pci_device.device,
+		 p->pci_device.function,
+		 p->npu_index);
 
-	devfn = PCI_DEVFN(p->pci_device.device, p->pci_device.function);
-	dev = MODS_PCI_GET_SLOT(p->pci_device.domain, p->pci_device.bus, devfn);
-	if (dev == NULL)  {
-		mods_error_printk("PCI device %04x:%02x:%02x.%x not found\n",
-				  p->pci_device.domain,
-				  p->pci_device.bus,
-				  p->pci_device.device,
-				  p->pci_device.function);
+	err = mods_find_pci_dev(client, &p->pci_device, &dev);
+	if (unlikely(err)) {
+		if (err == -ENODEV)
+			cl_error("dev %04x:%02x:%02x.%x not found\n",
+				 p->pci_device.domain,
+				 p->pci_device.bus,
+				 p->pci_device.device,
+				 p->pci_device.function);
 		goto exit;
 	}
 
-#if defined(MODS_HAS_PNV_PCI_GET_NPU_DEV)
-	npu_dev = pnv_pci_get_npu_dev(dev, p->npu_index);
-#endif
-	if (npu_dev == NULL) {
-		mods_error_printk("NPU device for %04x:%02x:%02x.%x not found\n",
-				  p->pci_device.domain,
-				  p->pci_device.bus,
-				  p->pci_device.device,
-				  p->pci_device.function);
+	err = -ENODEV;
+
+	npu_dev = get_npu_dev(dev, p->npu_index);
+	if (unlikely(npu_dev == NULL)) {
+		cl_error("NPU device for dev %04x:%02x:%02x.%x not found\n",
+			 p->pci_device.domain,
+			 p->pci_device.bus,
+			 p->pci_device.device,
+			 p->pci_device.function);
 		goto exit;
 	}
 
-	mods_debug_printk(DEBUG_PCI,
-			  "Found NPU device %04x:%02x:%02x.%x\n",
-			  pci_domain_nr(npu_dev->bus),
-			  npu_dev->bus->number,
-			  PCI_SLOT(npu_dev->devfn),
-			  PCI_FUNC(npu_dev->devfn));
+	cl_debug(DEBUG_PCI,
+		 "found NPU device %04x:%02x:%02x.%x\n",
+		 pci_domain_nr(npu_dev->bus),
+		 npu_dev->bus->number,
+		 PCI_SLOT(npu_dev->devfn),
+		 PCI_FUNC(npu_dev->devfn));
 
-	val32 = (const __u32 *)of_get_property(npu_dev->dev.of_node,
-					       "ibm,nvlink-speed",
-					       &len);
-
+	if (npu_dev->dev.of_node)
+		val32 = (const __u32 *)of_get_property(npu_dev->dev.of_node,
+						       "ibm,nvlink-speed",
+						       &len);
 	if (!val32) {
-		mods_error_printk("Property ibm,nvlink-speed for NPU not found\n");
+		cl_error("property ibm,nvlink-speed for NPU not found\n");
 		goto exit;
 	}
 
 	p->speed = be32_to_cpup(val32);
-
 	if (!p->speed) {
-		mods_error_printk("ibm,nvlink-speed value for NPU not valid\n");
+		cl_error("ibm,nvlink-speed value for NPU not valid\n");
 		goto exit;
 	}
 
-	ret = OK;
+	err = OK;
 
 exit:
+	/* We should call pci_dev_put(npu_dev), but it's currently crashing */
+	pci_dev_put(dev);
 	LOG_EXT();
-	return ret;
+	return err;
+}
+
+int esc_mods_pci_hot_reset(struct mods_client        *client,
+			   struct MODS_PCI_HOT_RESET *p)
+{
+	struct pci_dev *dev;
+	int err;
+
+	LOG_ENT();
+
+	cl_debug(DEBUG_PCI,
+		 "pci_hot_reset dev %04x:%02x:%02x.%x\n",
+		 p->pci_device.domain,
+		 p->pci_device.bus,
+		 p->pci_device.device,
+		 p->pci_device.function);
+
+	err = mods_find_pci_dev(client, &p->pci_device, &dev);
+	if (unlikely(err)) {
+		if (err == -ENODEV)
+			cl_error(
+				"pci_hot_reset cannot find dev %04x:%02x:%02x.%x\n",
+				p->pci_device.domain,
+				p->pci_device.bus,
+				p->pci_device.device,
+				p->pci_device.function);
+		LOG_EXT();
+		return err;
+	}
+
+	err = pci_set_pcie_reset_state(dev, pcie_hot_reset);
+	if (unlikely(err))
+		cl_error("pci_hot_reset failed on dev %04x:%02x:%02x.%x\n",
+			 p->pci_device.domain,
+			 p->pci_device.bus,
+			 p->pci_device.device,
+			 p->pci_device.function);
+	else {
+
+		err = pci_set_pcie_reset_state(dev, pcie_deassert_reset);
+		if (unlikely(err))
+			cl_error(
+				"pci_hot_reset deassert failed on dev %04x:%02x:%02x.%x\n",
+				p->pci_device.domain,
+				p->pci_device.bus,
+				p->pci_device.device,
+				p->pci_device.function);
+	}
+
+	pci_dev_put(dev);
+	LOG_EXT();
+	return err;
 }

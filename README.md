@@ -23,6 +23,10 @@ Use your distribution package meneger to install:
 * Toolchain and make program required for building C kernel modules (for ubuntu it is `build-essential` package).
 * Kernel headers of your kernel version (typically is is package named like `linux*headers*`).
 
+### Userspace tool naming for this module
+* Due to compatibility problems, mats binaries at least up to v400 must be named as `mats` or `mats400`. Other names are not accepted.
+* Due to compatibility problems, newer mats binaries must be named like `mats499` (replace 499 with real version).
+
 ### Loading module alternatives
 
 #### Alternative 1: universal - for any tools - manual loading

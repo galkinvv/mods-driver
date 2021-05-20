@@ -2,7 +2,7 @@
 /*
  * mods_irq.c - This file is part of NVIDIA MODS kernel driver.
  *
- * Copyright (c) 2008-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2008-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * NVIDIA MODS kernel driver is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License,
@@ -24,12 +24,14 @@
 #include <linux/poll.h>
 #include <linux/interrupt.h>
 #include <linux/pci_regs.h>
-#if defined(MODS_TEGRA) && defined(CONFIG_OF_IRQ) && defined(CONFIG_OF)
+#if defined(CONFIG_ARCH_TEGRA) && defined(CONFIG_OF) && defined(CONFIG_OF_IRQ)
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/io.h>
 #include <linux/platform_device.h>
 #include <linux/of_device.h>
+#include <linux/gpio.h>
+#include <linux/of_gpio.h>
 #endif
 
 #define PCI_VENDOR_ID_NVIDIA 0x10de
@@ -56,62 +58,91 @@ struct mutex *mods_get_irq_mutex(void)
 }
 
 #ifdef CONFIG_PCI
-struct en_dev_entry *mods_enable_device(struct mods_client *client,
-					struct pci_dev     *dev)
+int mods_enable_device(struct mods_client   *client,
+		       struct pci_dev       *dev,
+		       struct en_dev_entry **dev_entry)
 {
-	int                  ret   = -1;
+	int                  err   = OK;
 	struct en_dev_entry *dpriv = client->enabled_devices;
 
-	BUG_ON(!mutex_is_locked(&mp.mtx));
+	WARN_ON(!mutex_is_locked(&mp.mtx));
 
 	dpriv = pci_get_drvdata(dev);
-
 	if (dpriv) {
-		if (dpriv->client_id == client->client_id)
-			return dpriv;
+		if (dpriv->client_id == client->client_id) {
+			if (dev_entry)
+				*dev_entry = dpriv;
+			return OK;
+		}
 
-		mods_error_printk("invalid client %u for device %04x:%02x:%02x.%x\n",
-				  (unsigned int)client->client_id,
-				  pci_domain_nr(dev->bus),
-				  dev->bus->number,
-				  PCI_SLOT(dev->devfn),
-				  PCI_FUNC(dev->devfn));
-		return 0;
-	}
-
-	ret = pci_enable_device(dev);
-
-	if (ret != 0) {
-		mods_error_printk("failed to enable device %04x:%02x:%02x.%x\n",
-				  pci_domain_nr(dev->bus),
-				  dev->bus->number,
-				  PCI_SLOT(dev->devfn),
-				  PCI_FUNC(dev->devfn));
-		return 0;
+		cl_error(
+			"invalid client for dev %04x:%02x:%02x.%x, expected %u\n",
+			pci_domain_nr(dev->bus),
+			dev->bus->number,
+			PCI_SLOT(dev->devfn),
+			PCI_FUNC(dev->devfn),
+			dpriv->client_id);
+		return -EBUSY;
 	}
 
 	dpriv = kzalloc(sizeof(*dpriv), GFP_KERNEL | __GFP_NORETRY);
 	if (unlikely(!dpriv))
-		return 0;
-	dpriv->client_id = client->client_id;
-	dpriv->dev = dev;
-	dpriv->next = client->enabled_devices;
+		return -ENOMEM;
+	atomic_inc(&client->num_allocs);
+
+	err = pci_enable_device(dev);
+	if (unlikely(err)) {
+		cl_error("failed to enable dev %04x:%02x:%02x.%x\n",
+			 pci_domain_nr(dev->bus),
+			 dev->bus->number,
+			 PCI_SLOT(dev->devfn),
+			 PCI_FUNC(dev->devfn));
+		kfree(dpriv);
+		atomic_dec(&client->num_allocs);
+		return err;
+	}
+
+	cl_info("enabled dev %04x:%02x:%02x.%x\n",
+		pci_domain_nr(dev->bus),
+		dev->bus->number,
+		PCI_SLOT(dev->devfn),
+		PCI_FUNC(dev->devfn));
+
+	dpriv->client_id        = client->client_id;
+	dpriv->dev              = pci_dev_get(dev);
+	dpriv->next             = client->enabled_devices;
 	client->enabled_devices = dpriv;
 	pci_set_drvdata(dev, dpriv);
 
-	return dpriv;
+	if (dev_entry)
+		*dev_entry = dpriv;
+	return OK;
 }
 
-void mods_disable_device(struct pci_dev *dev)
+void mods_disable_device(struct mods_client *client,
+			 struct pci_dev     *dev)
 {
 	struct en_dev_entry *dpriv = pci_get_drvdata(dev);
 
-	BUG_ON(!mutex_is_locked(&mp.mtx));
+	WARN_ON(!mutex_is_locked(&mp.mtx));
 
-	if (dpriv)
+#ifdef MODS_HAS_SRIOV
+	if (dpriv->num_vfs)
+		pci_disable_sriov(dev);
+#endif
+
+	if (dpriv) {
 		pci_set_drvdata(dev, NULL);
+		pci_dev_put(dev);
+	}
 
 	pci_disable_device(dev);
+
+	cl_info("disabled dev %04x:%02x:%02x.%x\n",
+		pci_domain_nr(dev->bus),
+		dev->bus->number,
+		PCI_SLOT(dev->devfn),
+		PCI_FUNC(dev->devfn));
 }
 #endif
 
@@ -175,7 +206,9 @@ static void mods_disable_interrupts(struct dev_irq_map *t)
 		}
 	}
 	if ((ii == 0) && t->type == MODS_IRQ_TYPE_CPU) {
-		mods_debug_printk(DEBUG_ISR, "IRQ_DISABLE_NOSYNC ");
+		mods_debug_printk(DEBUG_ISR,
+				  "disable_irq_nosync %u",
+				  t->apic_irq);
 		disable_irq_nosync(t->apic_irq);
 	}
 }
@@ -198,21 +231,25 @@ static const char *mods_irq_type_name(u8 irq_type)
 }
 #endif
 
+static struct mods_client *client_from_id(u8 client_id)
+{
+	return &mp.clients[client_id - 1];
+}
+
 static void wake_up_client(struct dev_irq_map *t)
 {
-	struct mods_client *client = &mp.clients[t->client_id - 1];
+	struct mods_client *client = client_from_id(t->client_id);
 
 	if (client)
 		wake_up_interruptible(&client->interrupt_event);
 }
 
-static int rec_irq_done(struct dev_irq_map *t,
-			 unsigned int irq_time)
+static int rec_irq_done(struct mods_client *client,
+			struct dev_irq_map *t,
+			unsigned int        irq_time)
 {
-	struct irq_q_info *q;
-
 	/* Get interrupt queue */
-	q = &mp.clients[t->client_id - 1].irq_queue;
+	struct irq_q_info *q = &client->irq_queue;
 
 	/* Don't do anything if the IRQ has already been recorded */
 	if (q->head != q->tail) {
@@ -245,30 +282,26 @@ static int rec_irq_done(struct dev_irq_map *t,
 #ifdef CONFIG_PCI
 	if (t->dev) {
 		mods_debug_printk(DEBUG_ISR_DETAILED,
-			"%04x:%02x:%02x.%x %s IRQ 0x%x time=%uus\n",
-				  (unsigned int)(pci_domain_nr(t->dev->bus)),
-				  (unsigned int)(t->dev->bus->number),
-				  (unsigned int)PCI_SLOT(t->dev->devfn),
-				  (unsigned int)PCI_FUNC(t->dev->devfn),
-			mods_irq_type_name(t->type),
-			t->apic_irq,
-			irq_time);
+				  "dev %04x:%02x:%02x.%x %s IRQ 0x%x time=%uus\n",
+				  pci_domain_nr(t->dev->bus),
+				  t->dev->bus->number,
+				  PCI_SLOT(t->dev->devfn),
+				  PCI_FUNC(t->dev->devfn),
+				  mods_irq_type_name(t->type),
+				  t->apic_irq,
+				  irq_time);
 	} else
 #endif
 		mods_debug_printk(DEBUG_ISR_DETAILED,
-			"CPU IRQ 0x%x, time=%uus\n",
-			t->apic_irq,
-			irq_time);
+				  "CPU IRQ 0x%x, time=%uus\n",
+				  t->apic_irq,
+				  irq_time);
 
 	return true;
 }
 
 /* mods_irq_handle - interrupt function */
-static irqreturn_t mods_irq_handle(int irq, void *data
-#ifndef MODS_IRQ_HANDLE_NO_REGS
-			, struct pt_regs *regs
-#endif
-)
+static irqreturn_t mods_irq_handle(int irq, void *data)
 {
 	struct dev_irq_map *t        = (struct dev_irq_map *)data;
 	int                 serviced = false;
@@ -283,7 +316,7 @@ static irqreturn_t mods_irq_handle(int irq, void *data
 		unsigned long       flags    = 0;
 		int                 recorded = false;
 		unsigned int        irq_time = get_cur_time();
-		struct mods_client *client   = &mp.clients[t->client_id - 1];
+		struct mods_client *client   = client_from_id(t->client_id);
 
 		spin_lock_irqsave(&client->irq_lock, flags);
 
@@ -296,7 +329,7 @@ static irqreturn_t mods_irq_handle(int irq, void *data
 			mods_disable_interrupts(t);
 
 			/* Record IRQ for MODS and wake MODS up */
-			recorded = rec_irq_done(t, irq_time);
+			recorded = rec_irq_done(client, t, irq_time);
 
 			serviced = true;
 		}
@@ -317,22 +350,21 @@ static int mods_lookup_cpu_irq(u8 client_id, unsigned int irq)
 
 	LOG_ENT();
 
-	for (client_idx = 0; client_idx < MODS_MAX_CLIENTS; client_idx++) {
+	for (client_idx = 1; client_idx <= MODS_MAX_CLIENTS; client_idx++) {
 		struct dev_irq_map *t    = NULL;
 		struct dev_irq_map *next = NULL;
 
+		if (!test_bit(client_idx - 1, &mp.client_flags))
+			continue;
+
 		list_for_each_entry_safe(t,
 					 next,
-					 &mp.clients[client_idx].irq_list,
+					 &client_from_id(client_idx)->irq_list,
 					 list) {
 
 			if (t->apic_irq == irq) {
-				if (client_id == 0) {
-					ret = IRQ_FOUND;
-				} else {
-					ret = (client_id == client_idx + 1)
-						  ? IRQ_FOUND : IRQ_NOT_FOUND;
-				}
+				ret = (!client_id || client_id == client_idx)
+				      ? IRQ_FOUND : IRQ_NOT_FOUND;
 
 				/* Break out of the outer loop */
 				client_idx = MODS_MAX_CLIENTS;
@@ -363,13 +395,13 @@ static int is_nvidia_gpu(struct pci_dev *dev)
 #ifdef CONFIG_PCI
 static void setup_mask_info(struct dev_irq_map *newmap,
 			    struct MODS_REGISTER_IRQ_4 *p,
-			    struct pci_dev *pdev)
+			    struct pci_dev *dev)
 {
 	/* account for legacy adapters */
 	char *bar = newmap->dev_irq_aperture;
 	u32 ii = 0;
 
-	if ((p->mask_info_cnt == 0) && is_nvidia_gpu(pdev)) {
+	if ((p->mask_info_cnt == 0) && is_nvidia_gpu(dev)) {
 		newmap->mask_info_cnt = 1;
 		newmap->mask_info[0].dev_irq_mask_reg = (u32 *)(bar+0x140);
 		newmap->mask_info[0].dev_irq_disable_reg = (u32 *)(bar+0x140);
@@ -394,14 +426,42 @@ static void setup_mask_info(struct dev_irq_map *newmap,
 }
 #endif
 
-static int add_irq_map(u8 client_id,
-		       struct pci_dev *pdev,
-		       struct MODS_REGISTER_IRQ_4 *p, u32 irq, u32 entry)
+static int add_irq_map(struct mods_client         *client,
+		       struct pci_dev             *dev,
+		       struct MODS_REGISTER_IRQ_4 *p,
+		       u32                         irq,
+		       u32                         entry)
 {
-	u32 irq_type = MODS_IRQ_TYPE_FROM_FLAGS(p->irq_flags);
-	struct dev_irq_map *newmap = NULL;
+	struct dev_irq_map *newmap     = NULL;
+	u64                 valid_mask = IRQF_TRIGGER_NONE;
+	u64                 irq_flags  = MODS_IRQ_FLAG_FROM_FLAGS(p->irq_flags);
+	u32                 irq_type   = MODS_IRQ_TYPE_FROM_FLAGS(p->irq_flags);
 
 	LOG_ENT();
+
+	/* Get the flags based on the interrupt type*/
+	switch (irq_type) {
+	case MODS_IRQ_TYPE_INT:
+		irq_flags = IRQF_SHARED;
+		break;
+
+	case MODS_IRQ_TYPE_CPU:
+		valid_mask = IRQF_TRIGGER_RISING |
+			     IRQF_TRIGGER_FALLING |
+			     IRQF_SHARED;
+
+		/* Either use a valid flag bit or no flags */
+		if (irq_flags & ~valid_mask) {
+			cl_error("invalid device interrupt flag %llx\n",
+				 (long long)irq_flags);
+			return -EINVAL;
+		}
+		break;
+
+	default:
+		irq_flags = IRQF_TRIGGER_NONE;
+		break;
+	}
 
 	/* Allocate memory for the new entry */
 	newmap = kzalloc(sizeof(*newmap), GFP_KERNEL | __GFP_NORETRY);
@@ -409,31 +469,34 @@ static int add_irq_map(u8 client_id,
 		LOG_EXT();
 		return -ENOMEM;
 	}
+	atomic_inc(&client->num_allocs);
 
 	/* Fill out the new entry */
-	newmap->apic_irq = irq;
-	newmap->dev = pdev;
-	newmap->client_id = client_id;
+	newmap->apic_irq         = irq;
+	newmap->dev              = dev;
+	newmap->client_id        = client->client_id;
 	newmap->dev_irq_aperture = 0;
-	newmap->mask_info_cnt = 0;
-	newmap->type = irq_type;
-	newmap->entry = entry;
+	newmap->mask_info_cnt    = 0;
+	newmap->type             = irq_type;
+	newmap->entry            = entry;
 
 	/* Enable IRQ for this device in the kernel */
-	if (request_irq(
-			irq,
+	if (request_irq(irq,
 			&mods_irq_handle,
-			(irq_type == MODS_IRQ_TYPE_INT) ? IRQF_SHARED : 0,
+			irq_flags,
 			"nvidia mods",
 			newmap)) {
-		mods_error_printk("unable to enable IRQ 0x%x\n", irq);
+		cl_error("unable to enable IRQ 0x%x with flags %llx\n",
+			 irq,
+			 (long long)irq_flags);
 		kfree(newmap);
+		atomic_dec(&client->num_allocs);
 		LOG_EXT();
 		return -EPERM;
 	}
 
 	/* Add the new entry to the list of all registered interrupts */
-	list_add(&newmap->list, &mp.clients[client_id - 1].irq_list);
+	list_add(&newmap->list, &client->irq_list);
 
 #ifdef CONFIG_PCI
 	/* Map BAR0 to be able to disable interrupts */
@@ -443,66 +506,73 @@ static int add_irq_map(u8 client_id,
 		char *bar = ioremap(p->aperture_addr, p->aperture_size);
 
 		if (!bar) {
-			mods_debug_printk(DEBUG_ISR,
-				"failed to remap aperture: 0x%llx size=0x%x\n",
-				p->aperture_addr, p->aperture_size);
+			cl_debug(DEBUG_ISR,
+				 "failed to remap aperture: 0x%llx size=0x%x\n",
+				 p->aperture_addr,
+				 p->aperture_size);
 			LOG_EXT();
 			return -EPERM;
 		}
 
 		newmap->dev_irq_aperture = bar;
-		setup_mask_info(newmap, p, pdev);
+		setup_mask_info(newmap, p, dev);
 	}
+
+	if (dev)
+		pci_dev_get(dev);
 #endif
 
 	/* Print out successful registration string */
 	if (irq_type == MODS_IRQ_TYPE_CPU)
-		mods_debug_printk(DEBUG_ISR, "registered CPU IRQ 0x%x\n", irq);
+		cl_debug(DEBUG_ISR,
+			 "registered CPU IRQ 0x%x with flags %llx\n",
+			 irq,
+			 (long long)irq_flags);
 #ifdef CONFIG_PCI
 	else if ((irq_type == MODS_IRQ_TYPE_INT) ||
 		 (irq_type == MODS_IRQ_TYPE_MSI) ||
 		 (irq_type == MODS_IRQ_TYPE_MSIX)) {
-		mods_debug_printk(DEBUG_ISR,
-		"%04x:%02x:%02x.%x registered %s IRQ 0x%x\n",
-		(unsigned int)(pci_domain_nr(pdev->bus)),
-		(unsigned int)(pdev->bus->number),
-		(unsigned int)PCI_SLOT(pdev->devfn),
-		(unsigned int)PCI_FUNC(pdev->devfn),
-		mods_irq_type_name(irq_type),
-		  irq);
+		cl_debug(DEBUG_ISR,
+			 "dev %04x:%02x:%02x.%x registered %s IRQ 0x%x\n",
+			 pci_domain_nr(dev->bus),
+			 dev->bus->number,
+			 PCI_SLOT(dev->devfn),
+			 PCI_FUNC(dev->devfn),
+			 mods_irq_type_name(irq_type),
+			 irq);
 	}
 #endif
 #ifdef CONFIG_PCI_MSI
 	else if (irq_type == MODS_IRQ_TYPE_MSI) {
 		u16 control;
 		u16 data;
-		int cap_pos = pci_find_capability(pdev, PCI_CAP_ID_MSI);
+		int cap_pos = pci_find_capability(dev, PCI_CAP_ID_MSI);
 
-		pci_read_config_word(pdev, MSI_CONTROL_REG(cap_pos), &control);
+		pci_read_config_word(dev, MSI_CONTROL_REG(cap_pos), &control);
 		if (IS_64BIT_ADDRESS(control))
-			pci_read_config_word(pdev,
+			pci_read_config_word(dev,
 						 MSI_DATA_REG(cap_pos, 1),
 						 &data);
 		else
-			pci_read_config_word(pdev,
+			pci_read_config_word(dev,
 						 MSI_DATA_REG(cap_pos, 0),
 						 &data);
-		mods_debug_printk(DEBUG_ISR,
-			"%04x:%02x:%02x.%x registered MSI IRQ 0x%x data:0x%02x\n",
-			(unsigned int)(pci_domain_nr(pdev->bus)),
-			(unsigned int)(pdev->bus->number),
-			(unsigned int)PCI_SLOT(pdev->devfn),
-			(unsigned int)PCI_FUNC(pdev->devfn),
-			irq,
-			(unsigned int)data);
+		cl_debug(DEBUG_ISR,
+			 "dev %04x:%02x:%02x.%x registered MSI IRQ 0x%x data:0x%02x\n",
+			 pci_domain_nr(dev->bus),
+			 dev->bus->number,
+			 PCI_SLOT(dev->devfn),
+			 PCI_FUNC(dev->devfn),
+			 irq,
+			 data);
 	} else if (irq_type == MODS_IRQ_TYPE_MSIX) {
-		mods_debug_printk(DEBUG_ISR,
-			"%04x:%02x:%02x.%x registered MSI-X IRQ 0x%x\n",
-			(unsigned int)(pci_domain_nr(pdev->bus)),
-			(unsigned int)(pdev->bus->number),
-			(unsigned int)PCI_SLOT(pdev->devfn),
-			(unsigned int)PCI_FUNC(pdev->devfn),
-			irq);
+		cl_debug(DEBUG_ISR,
+			 "dev %04x:%02x:%02x.%x registered MSI-X IRQ 0x%x\n",
+			 pci_domain_nr(dev->bus),
+			 dev->bus->number,
+			 PCI_SLOT(dev->devfn),
+			 PCI_FUNC(dev->devfn),
+			 irq);
 	}
 #endif
 
@@ -510,12 +580,14 @@ static int add_irq_map(u8 client_id,
 	return OK;
 }
 
-static void mods_free_map(struct dev_irq_map *del)
+static void mods_free_map(struct mods_client *client,
+			  struct dev_irq_map *del)
 {
 	unsigned long       flags  = 0;
-	struct mods_client *client = &mp.clients[del->client_id - 1];
 
 	LOG_ENT();
+
+	WARN_ON(client->client_id != del->client_id);
 
 	/* Disable interrupts on the device */
 	spin_lock_irqsave(&client->irq_lock, flags);
@@ -529,8 +601,13 @@ static void mods_free_map(struct dev_irq_map *del)
 	if (del->dev_irq_aperture)
 		iounmap(del->dev_irq_aperture);
 
+#ifdef CONFIG_PCI
+	pci_dev_put(del->dev);
+#endif
+
 	/* Free memory */
 	kfree(del);
+	atomic_dec(&client->num_allocs);
 
 	LOG_EXT();
 }
@@ -552,7 +629,7 @@ void mods_cleanup_irq(void)
 
 	LOG_ENT();
 	for (i = 0; i < MODS_MAX_CLIENTS; i++) {
-		if (mp.client_flags && (1 << i))
+		if (mp.client_flags & (1 << i))
 			mods_free_client(i + 1);
 	}
 	LOG_EXT();
@@ -560,7 +637,7 @@ void mods_cleanup_irq(void)
 
 int mods_irq_event_check(u8 client_id)
 {
-	struct irq_q_info *q = &mp.clients[client_id - 1].irq_queue;
+	struct irq_q_info *q = &client_from_id(client_id)->irq_queue;
 	unsigned int pos = (1 << (client_id - 1));
 
 	if (!(mp.client_flags & pos))
@@ -574,7 +651,7 @@ int mods_irq_event_check(u8 client_id)
 
 struct mods_client *mods_alloc_client(void)
 {
-	u8 idx = 0;
+	u8 idx;
 	u8 max_clients = 1;
 
 	LOG_ENT();
@@ -583,24 +660,25 @@ struct mods_client *mods_alloc_client(void)
 	    (mods_get_access_token() != MODS_ACCESS_TOKEN_NONE))
 		max_clients = MODS_MAX_CLIENTS;
 
-	for (idx = 0; idx < max_clients; idx++) {
-		if (!test_and_set_bit(idx, &mp.client_flags)) {
-			struct mods_client *client = &mp.clients[idx];
-
-			mods_debug_printk(DEBUG_IOCTL,
-					  "open client %u (bit mask 0x%lx)\n",
-					  (unsigned int)(idx + 1),
-					  mp.client_flags);
+	for (idx = 1; idx <= max_clients; idx++) {
+		if (!test_and_set_bit(idx - 1, &mp.client_flags)) {
+			struct mods_client *client = client_from_id(idx);
 
 			memset(client, 0, sizeof(*client));
-			client->client_id = idx + 1;
+			client->client_id    = idx;
 			client->access_token = MODS_ACCESS_TOKEN_NONE;
+
+			cl_debug(DEBUG_IOCTL,
+				 "open client (bit mask 0x%lx)\n",
+				 mp.client_flags);
+
 			mutex_init(&client->mtx);
 			spin_lock_init(&client->irq_lock);
 			init_waitqueue_head(&client->interrupt_event);
 			INIT_LIST_HEAD(&client->irq_list);
 			INIT_LIST_HEAD(&client->mem_alloc_list);
 			INIT_LIST_HEAD(&client->mem_map_list);
+			INIT_LIST_HEAD(&client->free_mem_list);
 #if defined(CONFIG_PPC64)
 			INIT_LIST_HEAD(&client->ppc_tce_bypass_list);
 			INIT_LIST_HEAD(&client->nvlink_sysmem_trained_list);
@@ -615,10 +693,10 @@ struct mods_client *mods_alloc_client(void)
 	return NULL;
 }
 
-static int mods_free_irqs(u8 client_id, struct pci_dev *dev)
+static int mods_free_irqs(struct mods_client *client,
+			  struct pci_dev     *dev)
 {
 #ifdef CONFIG_PCI
-	struct mods_client  *client = &mp.clients[client_id - 1];
 	struct dev_irq_map  *del    = NULL;
 	struct dev_irq_map  *next;
 	struct en_dev_entry *dpriv;
@@ -639,27 +717,27 @@ static int mods_free_irqs(u8 client_id, struct pci_dev *dev)
 		return OK;
 	}
 
-	if (dpriv->client_id != client_id) {
-		mods_error_printk("invalid client %u for device %04x:%02x:%02x.%x\n",
-				  (unsigned int)client_id,
-				  pci_domain_nr(dev->bus),
-				  dev->bus->number,
-				  PCI_SLOT(dev->devfn),
-				  PCI_FUNC(dev->devfn));
+	if (dpriv->client_id != client->client_id) {
+		cl_error(
+			"invalid client for dev %04x:%02x:%02x.%x, expected %u\n",
+			pci_domain_nr(dev->bus),
+			dev->bus->number,
+			PCI_SLOT(dev->devfn),
+			PCI_FUNC(dev->devfn),
+			dpriv->client_id);
 		mutex_unlock(&mp.mtx);
 		LOG_EXT();
 		return -EINVAL;
 	}
 
-	mods_debug_printk(DEBUG_ISR_DETAILED,
-		"(dev=%04x:%02x:%02x.%x) irq_flags=0x%x nvecs=%d\n",
-		pci_domain_nr(dev->bus),
-		dev->bus->number,
-		PCI_SLOT(dev->devfn),
-		PCI_FUNC(dev->devfn),
-		dpriv->irq_flags,
-		dpriv->nvecs
-		);
+	cl_debug(DEBUG_ISR_DETAILED,
+		 "free IRQ for dev %04x:%02x:%02x.%x irq_flags=0x%x nvecs=%d\n",
+		 pci_domain_nr(dev->bus),
+		 dev->bus->number,
+		 PCI_SLOT(dev->devfn),
+		 PCI_FUNC(dev->devfn),
+		 dpriv->irq_flags,
+		 dpriv->nvecs);
 
 	/* Delete device interrupts from the list */
 	list_for_each_entry_safe(del, next, &client->irq_list, list) {
@@ -667,30 +745,32 @@ static int mods_free_irqs(u8 client_id, struct pci_dev *dev)
 			u8 type = del->type;
 
 			list_del(&del->list);
-			mods_debug_printk(DEBUG_ISR,
-				"%04x:%02x:%02x.%x unregistered %s IRQ 0x%x\n",
-				pci_domain_nr(dev->bus),
-				dev->bus->number,
-				PCI_SLOT(dev->devfn),
-				PCI_FUNC(dev->devfn),
-				mods_irq_type_name(type),
-				del->apic_irq);
-			mods_free_map(del);
+			cl_debug(DEBUG_ISR,
+				 "unregistered %s IRQ 0x%x dev %04x:%02x:%02x.%x\n",
+				 mods_irq_type_name(type),
+				 del->apic_irq,
+				 pci_domain_nr(dev->bus),
+				 dev->bus->number,
+				 PCI_SLOT(dev->devfn),
+				 PCI_FUNC(dev->devfn));
+			mods_free_map(client, del);
 
-			BUG_ON(type !=
-			       MODS_IRQ_TYPE_FROM_FLAGS(dpriv->irq_flags));
+			WARN_ON(MODS_IRQ_TYPE_FROM_FLAGS(dpriv->irq_flags)
+				!= type);
 			if (type != MODS_IRQ_TYPE_MSIX)
 				break;
 		}
 	}
 
-	mods_debug_printk(DEBUG_ISR_DETAILED, "before disable\n");
+	cl_debug(DEBUG_ISR_DETAILED, "before disable\n");
 #ifdef CONFIG_PCI_MSI
 	irq_type = MODS_IRQ_TYPE_FROM_FLAGS(dpriv->irq_flags);
 
 	if (irq_type == MODS_IRQ_TYPE_MSIX) {
 		pci_disable_msix(dev);
 		kfree(dpriv->msix_entries);
+		if (dpriv->msix_entries)
+			atomic_dec(&client->num_allocs);
 		dpriv->msix_entries = 0;
 	} else if (irq_type == MODS_IRQ_TYPE_MSI) {
 		pci_disable_msi(dev);
@@ -698,7 +778,7 @@ static int mods_free_irqs(u8 client_id, struct pci_dev *dev)
 #endif
 
 	dpriv->nvecs = 0;
-	mods_debug_printk(DEBUG_ISR_DETAILED, "irqs freed\n");
+	cl_debug(DEBUG_ISR_DETAILED, "irqs freed\n");
 #endif
 
 	mutex_unlock(&mp.mtx);
@@ -714,7 +794,7 @@ void mods_free_client_interrupts(struct mods_client *client)
 
 	/* Release all interrupts */
 	while (dpriv) {
-		mods_free_irqs(client->client_id, dpriv->dev);
+		mods_free_irqs(client, dpriv->dev);
 		dpriv = dpriv->next;
 	}
 
@@ -723,7 +803,7 @@ void mods_free_client_interrupts(struct mods_client *client)
 
 void mods_free_client(u8 client_id)
 {
-	struct mods_client *client = &mp.clients[client_id - 1];
+	struct mods_client *client = client_from_id(client_id);
 
 	LOG_ENT();
 
@@ -732,76 +812,79 @@ void mods_free_client(u8 client_id)
 	/* Indicate the client_id is free */
 	clear_bit(client_id - 1, &mp.client_flags);
 
-	mods_debug_printk(DEBUG_IOCTL, "closed client %u\n",
-			  (unsigned int)client_id);
+	cl_debug(DEBUG_IOCTL, "closed client\n");
 	LOG_EXT();
 }
 
 #ifdef CONFIG_PCI
-static int mods_allocate_irqs(u8 client_id, struct file *pfile,
-			      struct pci_dev *dev, u32 nvecs, u32 flags)
+static int mods_allocate_irqs(struct mods_client *client,
+			      struct pci_dev     *dev,
+			      u32                 nvecs,
+			      u32                 flags)
 {
-	struct mods_client  *client = pfile->private_data;
 	struct en_dev_entry *dpriv;
 	unsigned int         irq_type = MODS_IRQ_TYPE_FROM_FLAGS(flags);
+	int                  err      = OK;
 
 	LOG_ENT();
 
-	mods_debug_printk(DEBUG_ISR_DETAILED,
-		"(dev=%04x:%02x:%02x.%x, flags=0x%x, nvecs=%d)\n",
-		pci_domain_nr(dev->bus),
-		dev->bus->number,
-		PCI_SLOT(dev->devfn),
-		PCI_FUNC(dev->devfn),
-		flags,
-		nvecs);
+	cl_debug(DEBUG_ISR_DETAILED,
+		 "allocate %u IRQs on dev %04x:%02x:%02x.%x, flags=0x%x\n",
+		 nvecs,
+		 pci_domain_nr(dev->bus),
+		 dev->bus->number,
+		 PCI_SLOT(dev->devfn),
+		 PCI_FUNC(dev->devfn),
+		 flags);
 
 	/* Determine if the device supports requested interrupt type */
 	if (irq_type == MODS_IRQ_TYPE_MSI) {
 #ifdef CONFIG_PCI_MSI
 		if (pci_find_capability(dev, PCI_CAP_ID_MSI) == 0) {
-			mods_error_printk(
-				"dev %04x:%02x:%02x.%x does not support MSI\n",
-				pci_domain_nr(dev->bus),
-				dev->bus->number,
-				PCI_SLOT(dev->devfn),
-				PCI_FUNC(dev->devfn));
+			cl_error("dev %04x:%02x:%02x.%x does not support MSI\n",
+				 pci_domain_nr(dev->bus),
+				 dev->bus->number,
+				 PCI_SLOT(dev->devfn),
+				 PCI_FUNC(dev->devfn));
 			LOG_EXT();
-			return -EINVAL;
+			return -ENOENT;
 		}
 #else
-		mods_error_printk("the kernel does not support MSI!\n");
+		cl_error("the kernel does not support MSI\n");
+		LOG_EXT();
 		return -EINVAL;
 #endif
 	} else if (irq_type == MODS_IRQ_TYPE_MSIX) {
 #ifdef CONFIG_PCI_MSI
 		if (pci_find_capability(dev, PCI_CAP_ID_MSIX) == 0) {
-			mods_error_printk(
+			cl_error(
 				"dev %04x:%02x:%02x.%x does not support MSI-X\n",
 				pci_domain_nr(dev->bus),
 				dev->bus->number,
 				PCI_SLOT(dev->devfn),
 				PCI_FUNC(dev->devfn));
 			LOG_EXT();
-			return -EINVAL;
+			return -ENOENT;
 		}
 #else
-		mods_error_printk("the kernel does not support MSI-X!\n");
+		cl_error("the kernel does not support MSI-X\n");
+		LOG_EXT();
 		return -EINVAL;
 #endif
 	}
 
 	/* Enable device on the PCI bus */
-	dpriv = mods_enable_device(client, dev);
-	if (!dpriv) {
+	err = mods_enable_device(client, dev, &dpriv);
+	if (err) {
 		LOG_EXT();
-		return -EINVAL;
+		return err;
 	}
 
 	if (irq_type == MODS_IRQ_TYPE_INT) {
 		/* use legacy irq */
 		if (nvecs != 1) {
-			mods_error_printk("INTA: only 1 INTA vector supported requested %d!\n",
+			cl_error(
+				"INTA: only 1 INTA vector supported, requested %u\n",
 				nvecs);
 			LOG_EXT();
 			return -EINVAL;
@@ -812,20 +895,22 @@ static int mods_allocate_irqs(u8 client_id, struct file *pfile,
 #ifdef CONFIG_PCI_MSI
 	else if (irq_type == MODS_IRQ_TYPE_MSI) {
 		if (nvecs != 1) {
-			mods_error_printk("MSI: only 1 MSI vector supported requested %d!\n",
+			cl_error(
+				"MSI: only 1 MSI vector supported, requested %u\n",
 				nvecs);
 			LOG_EXT();
 			return -EINVAL;
 		}
-		if (pci_enable_msi(dev) != 0) {
-			mods_error_printk(
+		err = pci_enable_msi(dev);
+		if (err) {
+			cl_error(
 				"unable to enable MSI on dev %04x:%02x:%02x.%x\n",
 				pci_domain_nr(dev->bus),
 				dev->bus->number,
 				PCI_SLOT(dev->devfn),
 				PCI_FUNC(dev->devfn));
 			LOG_EXT();
-			return -EINVAL;
+			return err;
 		}
 		dpriv->nvecs = 1;
 	} else if (irq_type == MODS_IRQ_TYPE_MSIX) {
@@ -836,11 +921,12 @@ static int mods_allocate_irqs(u8 client_id, struct file *pfile,
 				GFP_KERNEL | __GFP_NORETRY);
 
 		if (!entries) {
-			mods_error_printk("could not allocate %d MSI-X entries!\n",
-				nvecs);
+			cl_error("could not allocate %d MSI-X entries\n",
+				 nvecs);
 			LOG_EXT();
 			return -ENOMEM;
 		}
+		atomic_inc(&client->num_allocs);
 
 		for (i = 0; i < nvecs; i++)
 			entries[i].entry = (uint16_t)i;
@@ -852,10 +938,11 @@ static int mods_allocate_irqs(u8 client_id, struct file *pfile,
 			/* returns number of interrupts allocated
 			 * < 0 indicates a failure.
 			 */
-			mods_error_printk(
+			cl_error(
 				"could not allocate the requested number of MSI-X vectors=%d return=%d!\n",
 				nvecs, cnt);
 			kfree(entries);
+			atomic_dec(&client->num_allocs);
 			LOG_EXT();
 			return cnt;
 		}
@@ -868,10 +955,11 @@ static int mods_allocate_irqs(u8 client_id, struct file *pfile,
 			 *  exceeding the number of irqs or MSI-X
 			 *  vectors available
 			 */
-			mods_error_printk(
+			cl_error(
 				"could not allocate the requested number of MSI-X vectors=%d return=%d!\n",
 				nvecs, cnt);
 			kfree(entries);
+			atomic_dec(&client->num_allocs);
 			LOG_EXT();
 			if (cnt > 0)
 				cnt = -ENOSPC;
@@ -879,113 +967,113 @@ static int mods_allocate_irqs(u8 client_id, struct file *pfile,
 		}
 #endif
 
-		mods_debug_printk(DEBUG_ISR,
-			"allocated %d irq's of type %s(%d)\n",
-			nvecs, mods_irq_type_name(irq_type), irq_type);
+		cl_debug(DEBUG_ISR,
+			 "allocated %d irq's of type %s(%d)\n",
+			 nvecs,
+			 mods_irq_type_name(irq_type),
+			 irq_type);
 
 		for (i = 0; i < nvecs; i++)
-			mods_debug_printk(DEBUG_ISR, "vec %d %x\n",
-				entries[i].entry, entries[i].vector);
+			cl_debug(DEBUG_ISR,
+				 "vec %d %x\n",
+				 entries[i].entry,
+				 entries[i].vector);
 
 		dpriv->nvecs = nvecs;
 		dpriv->msix_entries = entries;
 	}
 #endif
 	else {
-		mods_error_printk("unsupported irq_type %d dev: %04x:%02x:%02x.%x\n",
-				  irq_type,
-				  pci_domain_nr(dev->bus),
-				  dev->bus->number,
-				  PCI_SLOT(dev->devfn),
-				  PCI_FUNC(dev->devfn));
+		cl_error("unsupported irq_type %u dev %04x:%02x:%02x.%x\n",
+			 irq_type,
+			 pci_domain_nr(dev->bus),
+			 dev->bus->number,
+			 PCI_SLOT(dev->devfn),
+			 PCI_FUNC(dev->devfn));
 		LOG_EXT();
 		return -EINVAL;
 	}
 
-	dpriv->client_id = client_id;
+	WARN_ON(dpriv->client_id != client->client_id);
 	dpriv->irq_flags = flags;
 	LOG_EXT();
 	return OK;
 }
 
-static int mods_register_pci_irq(struct file *pfile,
+static int mods_register_pci_irq(struct mods_client         *client,
 				 struct MODS_REGISTER_IRQ_4 *p)
 {
-	int rc = OK;
-	unsigned int irq_type = MODS_IRQ_TYPE_FROM_FLAGS(p->irq_flags);
-	struct pci_dev *dev;
+	int                  err = OK;
+	unsigned int         irq_type = MODS_IRQ_TYPE_FROM_FLAGS(p->irq_flags);
+	struct pci_dev      *dev;
 	struct en_dev_entry *dpriv;
-	unsigned int devfn;
-	u8 client_id;
-	int i;
+	int                  i;
 
 	LOG_ENT();
 
-	/* Identify the caller */
-	client_id = get_client_id(pfile);
-	WARN_ON(!is_client_id_valid(client_id));
-	if (!is_client_id_valid(client_id)) {
+	if (unlikely(!p->irq_count)) {
+		cl_error("no irq's requested\n");
 		LOG_EXT();
 		return -EINVAL;
 	}
 
 	/* Get the PCI device structure for the specified device from kernel */
-	devfn = PCI_DEVFN(p->dev.device, p->dev.function);
-	dev = MODS_PCI_GET_SLOT(p->dev.domain, p->dev.bus, devfn);
-	if (!dev) {
-		mods_error_printk(
-				"unknown dev %04x:%02x:%02x.%x\n",
-				(unsigned int)p->dev.domain,
-				(unsigned int)p->dev.bus,
-				(unsigned int)p->dev.device,
-				(unsigned int)p->dev.function);
+	err = mods_find_pci_dev(client, &p->dev, &dev);
+	if (unlikely(err)) {
+		if (err == -ENODEV)
+			cl_error("dev %04x:%02x:%02x.%x not found\n",
+				 p->dev.domain,
+				 p->dev.bus,
+				 p->dev.device,
+				 p->dev.function);
 		LOG_EXT();
-		return -EINVAL;
-	}
-
-	if (!p->irq_count) {
-		mods_error_printk("no irq's requested!\n");
-		LOG_EXT();
-		return -EINVAL;
+		return err;
 	}
 
 	if (unlikely(mutex_lock_interruptible(&mp.mtx))) {
+		pci_dev_put(dev);
 		LOG_EXT();
 		return -EINTR;
 	}
 
 	dpriv = pci_get_drvdata(dev);
 	if (dpriv) {
-		if (dpriv->client_id != client_id) {
-			mods_error_printk("dev %04x:%02x:%02x.%x already owned by client %u\n",
-					  (unsigned int)p->dev.domain,
-					  (unsigned int)p->dev.bus,
-					  (unsigned int)p->dev.device,
-					  (unsigned int)p->dev.function,
-					  (unsigned int)dpriv->client_id);
+		if (dpriv->client_id != client->client_id) {
+			cl_error(
+				"dev %04x:%02x:%02x.%x already owned by client %u\n",
+				p->dev.domain,
+				p->dev.bus,
+				p->dev.device,
+				p->dev.function,
+				dpriv->client_id);
 			mutex_unlock(&mp.mtx);
+			pci_dev_put(dev);
 			LOG_EXT();
-			return -EINVAL;
+			return -EBUSY;
 		}
 		if (dpriv->nvecs) {
-			mods_error_printk("interrupt for dev %04x:%02x:%02x.%x already registered\n",
-					  (unsigned int)p->dev.domain,
-					  (unsigned int)p->dev.bus,
-					  (unsigned int)p->dev.device,
-					  (unsigned int)p->dev.function);
+			cl_error(
+				"interrupt for dev %04x:%02x:%02x.%x already registered\n",
+				p->dev.domain,
+				p->dev.bus,
+				p->dev.device,
+				p->dev.function);
 			mutex_unlock(&mp.mtx);
+			pci_dev_put(dev);
 			LOG_EXT();
 			return -EINVAL;
 		}
 	}
 
-	if (mods_allocate_irqs(client_id, pfile, dev, p->irq_count,
-			       p->irq_flags)) {
-		mods_error_printk("could not allocate irqs for irq_type %d\n",
-				  irq_type);
+	err = mods_allocate_irqs(client, dev, p->irq_count,
+				 p->irq_flags);
+	if (err) {
+		cl_error("could not allocate irqs for irq_type %d\n",
+			 irq_type);
 		mutex_unlock(&mp.mtx);
+		pci_dev_put(dev);
 		LOG_EXT();
-		return -EINVAL;
+		return err;
 	}
 
 	dpriv = pci_get_drvdata(dev);
@@ -995,40 +1083,32 @@ static int mods_register_pci_irq(struct file *pfile,
 				(irq_type == MODS_IRQ_TYPE_MSI)) ? dev->irq :
 			   dpriv->msix_entries[i].vector;
 
-		if (add_irq_map(client_id, dev, p, irq, i) != OK) {
+		err = add_irq_map(client, dev, p, irq, i);
+		if (unlikely(err)) {
 #ifdef CONFIG_PCI_MSI
 			if (irq_type == MODS_IRQ_TYPE_MSI)
 				pci_disable_msi(dev);
 			else if (irq_type == MODS_IRQ_TYPE_MSIX)
 				pci_disable_msix(dev);
 #endif
-			mutex_unlock(&mp.mtx);
-			LOG_EXT();
-			return -EINVAL;
+			break;
 		}
 	}
 
 	mutex_unlock(&mp.mtx);
+	pci_dev_put(dev);
 	LOG_EXT();
-	return rc;
+	return err;
 }
 #endif /* CONFIG_PCI */
 
-static int mods_register_cpu_irq(struct file *pfile,
+static int mods_register_cpu_irq(struct mods_client         *client,
 				 struct MODS_REGISTER_IRQ_4 *p)
 {
-	u8 client_id;
 	u32 irq = p->dev.bus;
+	int err;
 
 	LOG_ENT();
-
-	/* Identify the caller */
-	client_id = get_client_id(pfile);
-	WARN_ON(!is_client_id_valid(client_id));
-	if (!is_client_id_valid(client_id)) {
-		LOG_EXT();
-		return -EINVAL;
-	}
 
 	if (unlikely(mutex_lock_interruptible(&mp.mtx))) {
 		LOG_EXT();
@@ -1037,79 +1117,54 @@ static int mods_register_cpu_irq(struct file *pfile,
 
 	/* Determine if the interrupt is already hooked */
 	if (mods_lookup_cpu_irq(0, irq) == IRQ_FOUND) {
-		mods_error_printk("CPU IRQ 0x%x has already been registered\n",
-				  irq);
+		cl_error("CPU IRQ 0x%x has already been registered\n", irq);
 		mutex_unlock(&mp.mtx);
 		LOG_EXT();
 		return -EINVAL;
 	}
 
 	/* Register interrupt */
-	if (add_irq_map(client_id, 0, p, irq, 0) != OK) {
-		mutex_unlock(&mp.mtx);
-		LOG_EXT();
-		return -EINVAL;
-	}
+	err = add_irq_map(client, 0, p, irq, 0);
 
 	mutex_unlock(&mp.mtx);
-	return OK;
+	LOG_EXT();
+	return err;
 }
 
 #ifdef CONFIG_PCI
-static int mods_unregister_pci_irq(struct file *pfile,
+static int mods_unregister_pci_irq(struct mods_client         *client,
 				   struct MODS_REGISTER_IRQ_2 *p)
 {
 	struct pci_dev *dev;
-	unsigned int devfn;
-	u8 client_id;
-	int rv = OK;
+	int             err = OK;
 
 	LOG_ENT();
 
-	/* Identify the caller */
-	client_id = get_client_id(pfile);
-	WARN_ON(!is_client_id_valid(client_id));
-	if (!is_client_id_valid(client_id)) {
-		LOG_EXT();
-		return -EINVAL;
-	}
-
 	/* Get the PCI device structure for the specified device from kernel */
-	devfn = PCI_DEVFN(p->dev.device, p->dev.function);
-	dev = MODS_PCI_GET_SLOT(p->dev.domain, p->dev.bus, devfn);
-	if (!dev) {
+	err = mods_find_pci_dev(client, &p->dev, &dev);
+	if (unlikely(err)) {
 		LOG_EXT();
-		return -EINVAL;
+		return err;
 	}
 
-	rv = mods_free_irqs(client_id, dev);
+	err = mods_free_irqs(client, dev);
 
+	pci_dev_put(dev);
 	LOG_EXT();
-	return rv;
+	return err;
 }
 #endif
 
-static int mods_unregister_cpu_irq(struct file *pfile,
+static int mods_unregister_cpu_irq(struct mods_client *client,
 				   struct MODS_REGISTER_IRQ_2 *p)
 {
 	struct dev_irq_map *del = NULL;
 	struct dev_irq_map *next;
 	unsigned int        irq;
-	u8                  client_id;
-	struct mods_client *client;
 
 	LOG_ENT();
 
 	irq = p->dev.bus;
-
-	/* Identify the caller */
-	client_id = get_client_id(pfile);
-	WARN_ON(!is_client_id_valid(client_id));
-	if (!is_client_id_valid(client_id)) {
-		LOG_EXT();
-		return -EINVAL;
-	}
-	client = &mp.clients[client_id = 1];
 
 	if (unlikely(mutex_lock_interruptible(&mp.mtx))) {
 		LOG_EXT();
@@ -1117,10 +1172,8 @@ static int mods_unregister_cpu_irq(struct file *pfile,
 	}
 
 	/* Determine if the interrupt is already hooked by this client */
-	if (mods_lookup_cpu_irq(client_id, irq) == IRQ_NOT_FOUND) {
-		mods_error_printk(
-			"IRQ 0x%x not hooked, can't unhook\n",
-			irq);
+	if (mods_lookup_cpu_irq(client->client_id, irq) == IRQ_NOT_FOUND) {
+		cl_error("IRQ 0x%x not hooked, can't unhook\n", irq);
 		mutex_unlock(&mp.mtx);
 		LOG_EXT();
 		return -EINVAL;
@@ -1130,16 +1183,16 @@ static int mods_unregister_cpu_irq(struct file *pfile,
 	list_for_each_entry_safe(del, next, &client->irq_list, list) {
 		if ((irq == del->apic_irq) && (del->dev == 0)) {
 			if (del->type != p->type) {
-				mods_error_printk("wrong IRQ type passed\n");
+				cl_error("wrong IRQ type passed\n");
 				mutex_unlock(&mp.mtx);
 				LOG_EXT();
 				return -EINVAL;
 			}
 			list_del(&del->list);
-			mods_debug_printk(DEBUG_ISR,
-					  "unregistered CPU IRQ 0x%x\n",
-					  irq);
-			mods_free_map(del);
+			cl_debug(DEBUG_ISR,
+				 "unregistered CPU IRQ 0x%x\n",
+				 irq);
+			mods_free_map(client, del);
 			break;
 		}
 	}
@@ -1153,22 +1206,22 @@ static int mods_unregister_cpu_irq(struct file *pfile,
  * ESCAPE CALL FUNCTIONS *
  *************************/
 
-int esc_mods_register_irq_4(struct file *pfile,
+int esc_mods_register_irq_4(struct mods_client         *client,
 			    struct MODS_REGISTER_IRQ_4 *p)
 {
 	u32 irq_type = MODS_IRQ_TYPE_FROM_FLAGS(p->irq_flags);
 
 	if (irq_type == MODS_IRQ_TYPE_CPU)
-		return mods_register_cpu_irq(pfile, p);
+		return mods_register_cpu_irq(client, p);
 #ifdef CONFIG_PCI
-	return mods_register_pci_irq(pfile, p);
+	return mods_register_pci_irq(client, p);
 #else
-	mods_error_printk("PCI not available\n");
+	cl_error("PCI not available\n");
 	return -EINVAL;
 #endif
 }
 
-int esc_mods_register_irq_3(struct file *pfile,
+int esc_mods_register_irq_3(struct mods_client         *client,
 			    struct MODS_REGISTER_IRQ_3 *p)
 {
 	struct MODS_REGISTER_IRQ_4 irq_data = { {0} };
@@ -1196,10 +1249,10 @@ int esc_mods_register_irq_3(struct file *pfile,
 	irq_data.irq_count = 1;
 	irq_data.irq_flags = p->irq_type;
 
-	return esc_mods_register_irq_4(pfile, &irq_data);
+	return esc_mods_register_irq_4(client, &irq_data);
 }
 
-int esc_mods_register_irq_2(struct file *pfile,
+int esc_mods_register_irq_2(struct mods_client         *client,
 			    struct MODS_REGISTER_IRQ_2 *p)
 {
 	struct MODS_REGISTER_IRQ_4 irq_data = { {0} };
@@ -1211,24 +1264,24 @@ int esc_mods_register_irq_2(struct file *pfile,
 #ifdef CONFIG_PCI
 	{
 		/* Get the PCI device structure */
-		unsigned int devfn;
 		struct pci_dev *dev;
+		int             err;
 
-		devfn = PCI_DEVFN(p->dev.device, p->dev.function);
-		dev  = MODS_PCI_GET_SLOT(p->dev.domain, p->dev.bus, devfn);
-		if (!dev) {
-			LOG_EXT();
-			return -EINVAL;
-		}
+		err = mods_find_pci_dev(client, &p->dev, &dev);
+		if (unlikely(err))
+			return err;
+
 		irq_data.aperture_addr = pci_resource_start(dev, 0);
 		irq_data.aperture_size = pci_resource_len(dev, 0);
+
+		pci_dev_put(dev);
 	}
 #endif
 
-	return esc_mods_register_irq_4(pfile, &irq_data);
+	return esc_mods_register_irq_4(client, &irq_data);
 }
 
-int esc_mods_register_irq(struct file *pfile,
+int esc_mods_register_irq(struct mods_client       *client,
 			  struct MODS_REGISTER_IRQ *p)
 {
 	struct MODS_REGISTER_IRQ_2 register_irq = { {0} };
@@ -1239,54 +1292,44 @@ int esc_mods_register_irq(struct file *pfile,
 	register_irq.dev.function	= p->dev.function;
 	register_irq.type		= p->type;
 
-	return esc_mods_register_irq_2(pfile, &register_irq);
+	return esc_mods_register_irq_2(client, &register_irq);
 }
 
-int esc_mods_unregister_irq_2(struct file *pfile,
-				  struct MODS_REGISTER_IRQ_2 *p)
+int esc_mods_unregister_irq_2(struct mods_client         *client,
+			      struct MODS_REGISTER_IRQ_2 *p)
 {
 	if (p->type == MODS_IRQ_TYPE_CPU)
-		return mods_unregister_cpu_irq(pfile, p);
+		return mods_unregister_cpu_irq(client, p);
 #ifdef CONFIG_PCI
-	return mods_unregister_pci_irq(pfile, p);
+	return mods_unregister_pci_irq(client, p);
 #else
 	return -EINVAL;
 #endif
 }
 
-int esc_mods_unregister_irq(struct file *pfile,
-				struct MODS_REGISTER_IRQ *p)
+int esc_mods_unregister_irq(struct mods_client       *client,
+			    struct MODS_REGISTER_IRQ *p)
 {
 	struct MODS_REGISTER_IRQ_2 register_irq = { {0} };
 
-	register_irq.dev.domain		= 0;
-	register_irq.dev.bus		= p->dev.bus;
-	register_irq.dev.device		= p->dev.device;
-	register_irq.dev.function	= p->dev.function;
-	register_irq.type		= p->type;
+	register_irq.dev.domain   = 0;
+	register_irq.dev.bus      = p->dev.bus;
+	register_irq.dev.device   = p->dev.device;
+	register_irq.dev.function = p->dev.function;
+	register_irq.type         = p->type;
 
-	return esc_mods_unregister_irq_2(pfile, &register_irq);
+	return esc_mods_unregister_irq_2(client, &register_irq);
 }
 
-int esc_mods_query_irq_3(struct file *pfile, struct MODS_QUERY_IRQ_3 *p)
+int esc_mods_query_irq_3(struct mods_client      *client,
+			 struct MODS_QUERY_IRQ_3 *p)
 {
-	u8                  client_id;
-	struct mods_client *client;
 	struct irq_q_info  *q        = NULL;
 	unsigned int        i        = 0;
 	unsigned long       flags    = 0;
 	unsigned int        cur_time = get_cur_time();
 
 	LOG_ENT();
-
-	/* Identify the caller */
-	client_id = get_client_id(pfile);
-	WARN_ON(!is_client_id_valid(client_id));
-	if (!is_client_id_valid(client_id)) {
-		LOG_EXT();
-		return -EINVAL;
-	}
-	client = &mp.clients[client_id - 1];
 
 	/* Clear return array */
 	memset(p->irq_list, 0xFF, sizeof(p->irq_list));
@@ -1310,7 +1353,7 @@ int esc_mods_query_irq_3(struct file *pfile, struct MODS_QUERY_IRQ_3 *p)
 			p->irq_list[i].dev.function = PCI_FUNC(dev->devfn);
 		} else {
 			p->irq_list[i].dev.domain = 0;
-			p->irq_list[i].dev.bus = 0;
+			p->irq_list[i].dev.bus = q->data[index].irq;
 			p->irq_list[i].dev.device = 0xFFU;
 			p->irq_list[i].dev.function = 0xFFU;
 		}
@@ -1319,21 +1362,21 @@ int esc_mods_query_irq_3(struct file *pfile, struct MODS_QUERY_IRQ_3 *p)
 
 		/* Print info about IRQ status returned */
 		if (dev) {
-			mods_debug_printk(DEBUG_ISR_DETAILED,
-		   "retrieved IRQ index=%d dev %04x:%02x:%02x.%x, time=%uus, delay=%uus\n",
-				p->irq_list[i].irq_index,
-				(unsigned int)p->irq_list[i].dev.domain,
-				(unsigned int)p->irq_list[i].dev.bus,
-				(unsigned int)p->irq_list[i].dev.device,
-				(unsigned int)p->irq_list[i].dev.function,
-				q->data[index].time,
-				p->irq_list[i].delay);
+			cl_debug(DEBUG_ISR_DETAILED,
+				 "retrieved IRQ index=%d dev %04x:%02x:%02x.%x, time=%uus, delay=%uus\n",
+				 p->irq_list[i].irq_index,
+				 p->irq_list[i].dev.domain,
+				 p->irq_list[i].dev.bus,
+				 p->irq_list[i].dev.device,
+				 p->irq_list[i].dev.function,
+				 q->data[index].time,
+				 p->irq_list[i].delay);
 		} else {
-			mods_debug_printk(DEBUG_ISR_DETAILED,
-				"retrieved IRQ 0x%x, time=%uus, delay=%uus\n",
-				(unsigned int)p->irq_list[i].dev.bus,
-				q->data[index].time,
-				p->irq_list[i].delay);
+			cl_debug(DEBUG_ISR_DETAILED,
+				 "retrieved IRQ 0x%x, time=%uus, delay=%uus\n",
+				 (unsigned int)p->irq_list[i].dev.bus,
+				 q->data[index].time,
+				 p->irq_list[i].delay);
 		}
 	}
 
@@ -1348,12 +1391,13 @@ int esc_mods_query_irq_3(struct file *pfile, struct MODS_QUERY_IRQ_3 *p)
 	return OK;
 }
 
-int esc_mods_query_irq_2(struct file *pfile, struct MODS_QUERY_IRQ_2 *p)
+int esc_mods_query_irq_2(struct mods_client      *client,
+			 struct MODS_QUERY_IRQ_2 *p)
 {
 	int retval, i;
 	struct MODS_QUERY_IRQ_3 query_irq = { { { { 0 } } } };
 
-	retval = esc_mods_query_irq_3(pfile, &query_irq);
+	retval = esc_mods_query_irq_3(client, &query_irq);
 	if (retval)
 		return retval;
 
@@ -1365,13 +1409,13 @@ int esc_mods_query_irq_2(struct file *pfile, struct MODS_QUERY_IRQ_2 *p)
 	return OK;
 }
 
-int esc_mods_query_irq(struct file *pfile,
-			   struct MODS_QUERY_IRQ *p)
+int esc_mods_query_irq(struct mods_client    *client,
+		       struct MODS_QUERY_IRQ *p)
 {
 	int retval, i;
 	struct MODS_QUERY_IRQ_3 query_irq = { { { { 0 } } } };
 
-	retval = esc_mods_query_irq_3(pfile, &query_irq);
+	retval = esc_mods_query_irq_3(client, &query_irq);
 	if (retval)
 		return retval;
 
@@ -1386,34 +1430,22 @@ int esc_mods_query_irq(struct file *pfile,
 	return OK;
 }
 
-int esc_mods_irq_handled_2(struct file *pfile,
+int esc_mods_irq_handled_2(struct mods_client         *client,
 			   struct MODS_REGISTER_IRQ_2 *p)
 {
-	u8                  client_id;
-	struct mods_client *client;
 	unsigned long       flags = 0;
 	u32                 irq = p->dev.bus;
 	struct dev_irq_map *t = NULL;
 	struct dev_irq_map *next = NULL;
-	int                 ret = -EINVAL;
+	int                 err = -EINVAL;
 
 	if (p->type != MODS_IRQ_TYPE_CPU)
 		return -EINVAL;
 
 	LOG_ENT();
 
-	/* Identify the caller */
-	client_id = get_client_id(pfile);
-	WARN_ON(!is_client_id_valid(client_id));
-	if (!is_client_id_valid(client_id)) {
-		LOG_EXT();
-		return -EINVAL;
-	}
-	client = &mp.clients[client_id - 1];
-
 	/* Print info */
-	mods_debug_printk(DEBUG_ISR_DETAILED,
-			  "mark CPU IRQ 0x%x handled\n", irq);
+	cl_debug(DEBUG_ISR_DETAILED, "mark CPU IRQ 0x%x handled\n", irq);
 
 	/* Lock IRQ queue */
 	spin_lock_irqsave(&client->irq_lock, flags);
@@ -1421,11 +1453,11 @@ int esc_mods_irq_handled_2(struct file *pfile,
 	list_for_each_entry_safe(t, next, &client->irq_list, list) {
 		if (t->apic_irq == irq) {
 			if (t->type != p->type) {
-				mods_error_printk(
-				"IRQ type doesn't match registered IRQ\n");
+				cl_error(
+					"IRQ type doesn't match registered IRQ\n");
 			} else {
 				enable_irq(irq);
-				ret = OK;
+				err = OK;
 			}
 			break;
 		}
@@ -1435,28 +1467,28 @@ int esc_mods_irq_handled_2(struct file *pfile,
 	spin_unlock_irqrestore(&client->irq_lock, flags);
 
 	LOG_EXT();
-	return ret;
+	return err;
 }
 
-int esc_mods_irq_handled(struct file *pfile,
+int esc_mods_irq_handled(struct mods_client       *client,
 			 struct MODS_REGISTER_IRQ *p)
 {
 	struct MODS_REGISTER_IRQ_2 register_irq = { {0} };
 
-	register_irq.dev.domain		= 0;
-	register_irq.dev.bus		= p->dev.bus;
-	register_irq.dev.device		= p->dev.device;
-	register_irq.dev.function	= p->dev.function;
-	register_irq.type		= p->type;
+	register_irq.dev.domain   = 0;
+	register_irq.dev.bus      = p->dev.bus;
+	register_irq.dev.device   = p->dev.device;
+	register_irq.dev.function = p->dev.function;
+	register_irq.type         = p->type;
 
-	return esc_mods_irq_handled_2(pfile, &register_irq);
+	return esc_mods_irq_handled_2(client, &register_irq);
 }
 
-#if defined(MODS_TEGRA) && defined(CONFIG_OF_IRQ) && defined(CONFIG_OF)
-int esc_mods_map_irq(struct file *pfile,
-					 struct MODS_DT_INFO *p)
+#if defined(CONFIG_ARCH_TEGRA) && defined(CONFIG_OF_IRQ) && defined(CONFIG_OF)
+int esc_mods_map_irq(struct mods_client  *client,
+		     struct MODS_DT_INFO *p)
 {
-	int ret;
+	int err = 0;
 	/* the physical irq */
 	int hwirq;
 	/* platform device handle */
@@ -1466,18 +1498,30 @@ int esc_mods_map_irq(struct file *pfile,
 	/* Search for the node by device tree name */
 	struct device_node *np = of_find_node_by_name(NULL, p->dt_name);
 
+	if (!np) {
+		cl_error("node %s is not valid\n", p->full_name);
+		err = -EINVAL;
+		goto error;
+	}
+
 	/* Can be multiple nodes that share the same dt name, */
 	/* make sure you get the correct node matched by the device's full */
 	/* name in device tree (i.e. watchdog@30c0000 as opposed */
 	/* to watchdog) */
-	while (of_node_cmp(np->full_name, p->full_name) != 0)
+	while (of_node_cmp(np->full_name, p->full_name)) {
 		np = of_find_node_by_name(np, p->dt_name);
+		if (!np) {
+			cl_error("node %s is not valid\n", p->full_name);
+			err = -EINVAL;
+			goto error;
+		}
+	}
 
 	p->irq = irq_of_parse_and_map(np, p->index);
-	ret = of_irq_parse_one(np, p->index, &oirq);
-	if (ret) {
-		mods_error_printk("Could not parse IRQ\n");
-		return -EINVAL;
+	err = of_irq_parse_one(np, p->index, &oirq);
+	if (err) {
+		cl_error("could not parse IRQ\n");
+		goto error;
 	}
 
 	hwirq = oirq.args[1];
@@ -1498,8 +1542,60 @@ int esc_mods_map_irq(struct file *pfile,
 		TOP_TKE_TKEIE(hwirq));
 	}
 
+error:
+	of_node_put(np);
 	/* enable the interrupt */
-	return 0;
+	return err;
+}
 
+int esc_mods_map_irq_to_gpio(struct mods_client    *client,
+			     struct MODS_GPIO_INFO *p)
+{
+	//TODO: Make sure you are allocating gpio properly
+	int gpio_handle;
+	int irq;
+	int err = 0;
+
+	struct device_node *np = of_find_node_by_name(NULL, p->dt_name);
+
+	if (!np) {
+		cl_error("node %s is not valid\n", p->full_name);
+		err = -EINVAL;
+		goto error;
+	}
+
+	while (of_node_cmp(np->full_name, p->full_name)) {
+		np = of_find_node_by_name(np, p->dt_name);
+		if (!np) {
+			cl_error("node %s is not valid\n", p->full_name);
+			err = -EINVAL;
+			goto error;
+		}
+	}
+
+	gpio_handle = of_get_named_gpio(np, p->name, 0);
+	if (!gpio_is_valid(gpio_handle)) {
+		cl_error("gpio %s is missing\n", p->name);
+		err = gpio_handle;
+		goto error;
+	}
+
+	err = gpio_direction_input(gpio_handle);
+	if (err < 0) {
+		cl_error("pex_rst_gpio input direction change failed\n");
+		goto error;
+	}
+
+	irq = gpio_to_irq(gpio_handle);
+	if (irq < 0) {
+		cl_error("Unable to get irq for pex_rst_gpio\n");
+		err = -EINVAL;
+		goto error;
+	}
+	p->irq = irq;
+
+error:
+	of_node_put(np);
+	return err;
 }
 #endif
