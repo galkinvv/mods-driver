@@ -86,8 +86,8 @@ mkdir -p "${MODULE_DIR}"
 # Clean the precompiled module
 make -C "$MODULE_DIR" clean || die "Cleanup failed"
 
-# Compile the module
-make -C "$MODULE_DIR" || die "Compilation failed"
+# Compile the module with disabled gcc plugins to allow some gcc version mismatch
+make -C "$MODULE_DIR" GCC_PLUGINS_CFLAGS= || die "Compilation failed"
 
 # Try to insert the compiled module
 $INSMOD "${MODULE_DIR}${MODULE_NAME}.ko" || die "Unable to load the module"
