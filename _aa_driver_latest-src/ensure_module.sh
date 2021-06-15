@@ -23,7 +23,7 @@ cd "$SELF_DIR"
 
 MODULE_NAME="mods"
 KERN_VERSION=`uname -r`
-MODULE_DIR="build-${KERN_VERSION}/"
+MODULE_DIR="../driver-mods-local-builds/${KERN_VERSION}/"
 INSMOD="/sbin/insmod"
 RMMOD="/sbin/rmmod"
 MODPROBE="/sbin/modprobe"
@@ -78,16 +78,13 @@ command -v make >/dev/null || die "'make' program is not installed.\nPlease inst
 
 mkdir -p "${MODULE_DIR}"
 
-(
-    cd "${MODULE_DIR}"
-    ln -fs ../Makefile ../*.c ../*.h ./
-)
+ln -fs "$SELF_DIR/Makefile" "$SELF_DIR"/*.c "$SELF_DIR"/*.h "${MODULE_DIR}"
 
 # Clean the precompiled module
 make -C "$MODULE_DIR" clean || die "Cleanup failed"
 
-# Compile the module with disabled gcc plugins to allow some gcc version mismatch
-make -C "$MODULE_DIR" GCC_PLUGINS_CFLAGS= || die "Compilation failed"
+# Compile the module with disabled gcc plugins and disabled BTF to allow some compiler version mismatch
+make -C "$MODULE_DIR" GCC_PLUGINS_CFLAGS= CONFIG_DEBUG_INFO_BTF_MODULES= || die "Compilation failed"
 
 # Try to insert the compiled module
 $INSMOD "${MODULE_DIR}${MODULE_NAME}.ko" || die "Unable to load the module"
