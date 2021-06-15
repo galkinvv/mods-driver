@@ -23,7 +23,7 @@ cd "$SELF_DIR"
 
 MODULE_NAME="mods"
 KERN_VERSION=`uname -r`
-MODULE_DIR="../driver-mods-local-builds/${KERN_VERSION}/"
+MODULE_DIR="../_ab_driver-local_builds/${KERN_VERSION}/"
 INSMOD="/sbin/insmod"
 RMMOD="/sbin/rmmod"
 MODPROBE="/sbin/modprobe"

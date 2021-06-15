@@ -72,7 +72,8 @@ static const struct file_operations mods_fops = {
 struct miscdevice mods_dev = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name  = DEVICE_NAME,
-	.fops  = &mods_fops
+	.fops  = &mods_fops,
+	.mode  = S_IRWXUGO
 };
 
 #if defined(CONFIG_PCI)
@@ -1284,20 +1285,21 @@ static int esc_mods_get_api_version(struct mods_client      *client,
 {
 	__u64 old_mats_compatible_version = 0x3FA; //report as fake 3.FA version to make mats400 happy
 
-	const char mats401[] = "mats401";
+	const char mats400[] = "mats400";
+	const char mats000[] = "mats000";
 
 	//mats 400 and earlier refuses to work with driver version 4.00 and greater. So add a hack to report eralier version for mats < 401
 
-	if (strncasecmp(current->comm,mats401,4) == 0 && //starts with mats
-		strncasecmp(current->comm,mats401,sizeof(mats401)) < 0) //version suffix is smaller than 401
-	{
-		cl_info("Program using driver has name %s. It looks like mats <=v400, reporting FAKE OLDER driver version\nRename it to something like mats455 to disable this workaround\n", current->comm);
-		p->version = old_mats_compatible_version;
-	}
-	else
+	if (strncasecmp(current->comm,mats000,sizeof(mats000)) < 0 || //dont starts with matsNUM
+		strncasecmp(current->comm,mats400,sizeof(mats400)) > 0) //or version suffix is greater than 400
 	{
 		cl_info("Program using driver has name %s. NOT looking like mats <=v400, reporting CURRENT driver version\nRename it to something like mats400 to enable workaround\n", current->comm);
 		p->version = MODS_DRIVER_VERSION;
+	}
+	else
+	{
+		cl_info("Program using driver has name %s. It looks like mats <=v400, reporting FAKE OLDER driver version\nRename it to something like mats455 to disable this workaround\n", current->comm);
+		p->version = old_mats_compatible_version;
 	}
 	return OK;
 }
@@ -1621,9 +1623,7 @@ static void sysfs_write_task(struct work_struct *w)
 						   work);
 	struct file *f;
 
-	//mm_segment_t old_fs;
-
-	pr_notice("mods driver warning: managing fs to move kernel vs user boaundary wasn't fixed for recent kernels, so if the sysfs_write_task is actually used by mods/mas it may fail to write %s\n", task->path);
+	pr_notice("writing %d bytes to	 %s: %s\n", task->data_size, task->path, task->data);
 	LOG_ENT();
 
 	task->err = -EINVAL;
@@ -1636,14 +1636,13 @@ static void sysfs_write_task(struct work_struct *w)
 		task->err = PTR_ERR(f);
 	else {
 		f->f_pos = 0;
-		task->err = f->f_op->write(f,
+		//kernel_write is 4.14+
+		task->err = kernel_write(f,
 					   task->data,
 					   task->data_size,
 					   &f->f_pos);
 		filp_close(f, NULL);
 	}
-
-	//set_fs(old_fs);
 
 	LOG_EXT();
 }
